@@ -6,6 +6,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  TINY_WEBP_REQUIRE_ORACLE: "1"
 
 jobs:
   test:
@@ -14,7 +15,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            libwebp_archive: https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-1.6.0-linux-x86-64.tar.gz
+            libwebp_sha256: 1c5ffab71efecefa0e3c23516c3a3a1dccb45cc310ae1095c6f14ae268e38067
+          - os: macos-latest
+            libwebp_archive: https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-1.6.0-mac-arm64.tar.gz
+            libwebp_sha256: bc6bf84cc70f3f8574fba797d1e4a7dea4feebe9fa4be919f202413ea2b3b8f2
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -23,15 +30,23 @@ jobs:
 
       - name: install libwebp
         run: |
-          if [ "$RUNNER_OS" = "Linux" ]; then
-            sudo apt-get update && sudo apt-get install -y webp
-          else
-            brew install webp
-          fi
+          archive="$RUNNER_TEMP/libwebp.tar.gz"
+          install_dir="$RUNNER_TEMP/libwebp"
+          curl --fail --location --silent --show-error \
+            "${{ matrix.libwebp_archive }}" --output "$archive"
+          printf '%s  %s\n' "${{ matrix.libwebp_sha256 }}" "$archive" \
+            | shasum -a 256 --check -
+          mkdir "$install_dir"
+          tar -xzf "$archive" -C "$install_dir" --strip-components=1
+          echo "$install_dir/bin" >> "$GITHUB_PATH"
       - name: name the oracle version
         run: |
-          cwebp -version
-          dwebp -version
+          cwebp_version="$(cwebp -version 2>&1)"
+          dwebp_version="$(dwebp -version 2>&1)"
+          printf '%s\n' "$cwebp_version"
+          printf '%s\n' "$dwebp_version"
+          test "$cwebp_version" = "1.6.0"
+          test "$dwebp_version" = "1.6.0"
 
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
