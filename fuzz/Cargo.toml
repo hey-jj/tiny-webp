@@ -1,0 +1,22 @@
+[package]
+name = "tiny-webp-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+image-webp = "0.2.4"
+libfuzzer-sys = "0.4"
+tiny-webp = { path = ".." }
+
+[[bin]]
+name = "encode"
+path = "fuzz_targets/encode.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

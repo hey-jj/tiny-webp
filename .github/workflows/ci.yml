@@ -99,3 +99,13 @@ jobs:
       - run: cargo build --lib --bins --all-features
       - run: cargo build --no-default-features
       - run: cargo build --no-default-features --features std
+
+  fuzz:
+    name: fuzz
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install cargo-fuzz --locked
+      - run: cargo fuzz run -s none encode -- -runs=20000 -max_len=65536
