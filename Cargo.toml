@@ -42,6 +42,7 @@ image-webp = { version = "0.2.4", optional = true }
 [dev-dependencies]
 criterion = "0.7"
 image-webp = "0.2.4"
+sha2 = "0.10"
 
 [[bin]]
 name = "tiny-webp"
