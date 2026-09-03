@@ -23,7 +23,8 @@ pub(crate) const AC_QLOOKUP: [i32; 128] = [
     209, 213, 217, 221, 225, 229, 234, 239, 245, 249, 254, 259, 264, 269, 274, 279, 284,
 ];
 
-// The M1 charter's R1 formula defines this encode-time quality lookup.
+// This table stores floor(127 * (1 - cbrt(linear))), where c = q / 100 and
+// linear = 2 * c / 3 below 0.75 or 2 * c - 1 otherwise.
 pub(crate) const Q_TO_INDEX: [u8; 101] = [
     127, 103, 96, 92, 89, 86, 83, 81, 79, 77, 75, 73, 72, 70, 69, 68, 66, 65, 64, 63, 62, 61, 60,
     59, 58, 57, 56, 55, 54, 53, 52, 51, 51, 50, 49, 48, 48, 47, 46, 45, 45, 44, 43, 43, 42, 41, 41,

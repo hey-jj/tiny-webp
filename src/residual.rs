@@ -32,7 +32,9 @@ const COEFF_TREE: [i8; 22] = [
 // RFC 6386 section 13.3 defines the coefficient bands.
 const COEFF_BANDS: [usize; 16] = [0, 1, 2, 3, 6, 4, 5, 6, 6, 6, 6, 6, 6, 6, 6, 7];
 
-// RFC 6386 section 13 defines the scan. The M1 charter states its order.
+// RFC 6386 section 13 names the zigzag scan and delegates its list to the attachment.
+// The encoder writes raster positions in this order: 0, 1, 4, 8, 5, 2, 3, 6,
+// 9, 12, 13, 10, 7, 11, 14, 15.
 const ZIGZAG: [usize; 16] = [0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15];
 
 // RFC 6386 section 13.2 defines the category offset probabilities.
