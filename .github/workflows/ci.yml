@@ -45,8 +45,8 @@ jobs:
           dwebp_version="$(dwebp -version 2>&1)"
           printf '%s\n' "$cwebp_version"
           printf '%s\n' "$dwebp_version"
-          test "$cwebp_version" = "1.6.0"
-          test "$dwebp_version" = "1.6.0"
+          test "$(printf '%s\n' "$cwebp_version" | sed -n '1p')" = "1.6.0"
+          test "$(printf '%s\n' "$dwebp_version" | sed -n '1p')" = "1.6.0"
 
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
