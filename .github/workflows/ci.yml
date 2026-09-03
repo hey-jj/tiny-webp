@@ -65,7 +65,7 @@ jobs:
 
       - run: cargo bench --no-run
       - run: cargo run --example fixtures
-      - run: cargo run --example bench
+      - run: cargo run --example bench -- --smoke
 
       - name: build the documentation
         env:
