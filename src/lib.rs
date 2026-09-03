@@ -40,6 +40,8 @@ mod bool_coder;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod prediction;
 mod quantize;
+#[cfg_attr(not(test), allow(dead_code))]
+mod transform;
 
 use alloc::vec::Vec;
 use core::fmt;
