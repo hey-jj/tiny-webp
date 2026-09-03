@@ -87,8 +87,10 @@ pub enum Filter {
 
 /// Settings for one encode.
 ///
-/// [`Options::default`] matches cwebp's defaults for the knobs both tools
-/// carry.
+/// In version 0.1.0, [`Options::default`] uses quality 75 and keeps alpha
+/// lossless. Its [`Filter::Auto`] setting signals loop filter level 0. The
+/// default writes `VP8X` only when transparency needs it or
+/// [`Options::force_vp8x`] requests it.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Options {
