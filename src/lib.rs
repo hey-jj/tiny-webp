@@ -32,10 +32,11 @@
 #![deny(clippy::float_arithmetic)]
 
 extern crate alloc;
-
 #[cfg(test)]
 extern crate std;
 
+#[allow(dead_code)]
+mod bool_coder;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod prediction;
 mod quantize;
