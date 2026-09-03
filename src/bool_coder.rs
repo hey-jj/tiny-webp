@@ -10,9 +10,14 @@ pub(crate) struct BoolEncoder {
 }
 
 impl BoolEncoder {
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
+        Self::with_capacity(0)
+    }
+
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
         Self {
-            output: Vec::new(),
+            output: Vec::with_capacity(capacity),
             range: 255,
             bottom: 0,
             bit_count: 24,
@@ -188,6 +193,17 @@ impl<'a> BoolDecoder<'a> {
 #[cfg(test)]
 mod tests {
     use super::{BoolDecoder, BoolEncoder};
+    use crate::frame::{KF_UV_MODE_PROBS, KF_Y_MODE_PROBS, KF_Y_MODE_TREE, UV_MODE_TREE};
+    use crate::residual::{COEFF_TREE, DEFAULT_COEFF_PROBS};
+
+    #[derive(Clone, Copy)]
+    enum Operation {
+        Bool(u8, bool),
+        Literal(u32, u8),
+        Coefficient(u8),
+        LumaMode(u8),
+        ChromaMode(u8),
+    }
 
     fn encode_pairs(pairs: &[(u8, bool)]) -> alloc::vec::Vec<u8> {
         let mut encoder = BoolEncoder::new();
@@ -296,6 +312,57 @@ mod tests {
         let mut decoder = BoolDecoder::new(&encoded);
         for value in [0, 1, 2, 3] {
             assert_eq!(decoder.read_tree(&tree, &probabilities), value);
+        }
+    }
+
+    #[test]
+    fn a_seeded_mix_of_bools_literals_and_tree_values_reads_back_exactly() {
+        let mut seed = 0x91e1_0da5u32;
+        let mut operations = alloc::vec::Vec::new();
+        for probability in 1..=255u8 {
+            operations.push(Operation::Bool(probability, next_seed(&mut seed) & 1 != 0));
+            let width = (next_seed(&mut seed) % 8 + 1) as u8;
+            let literal = next_seed(&mut seed) & ((1u32 << width) - 1);
+            operations.push(Operation::Literal(literal, width));
+            operations.push(Operation::Coefficient((next_seed(&mut seed) % 12) as u8));
+            operations.push(Operation::LumaMode((next_seed(&mut seed) % 5) as u8));
+            operations.push(Operation::ChromaMode((next_seed(&mut seed) % 4) as u8));
+        }
+
+        let mut encoder = BoolEncoder::new();
+        for operation in &operations {
+            match *operation {
+                Operation::Bool(probability, value) => encoder.write_bool(probability, value),
+                Operation::Literal(value, width) => encoder.write_literal(value, width),
+                Operation::Coefficient(value) => {
+                    encoder.write_tree(&COEFF_TREE, &DEFAULT_COEFF_PROBS[..11], value)
+                }
+                Operation::LumaMode(value) => {
+                    encoder.write_tree(&KF_Y_MODE_TREE, &KF_Y_MODE_PROBS, value)
+                }
+                Operation::ChromaMode(value) => {
+                    encoder.write_tree(&UV_MODE_TREE, &KF_UV_MODE_PROBS, value)
+                }
+            }
+        }
+
+        let encoded = encoder.finish();
+        let mut decoder = BoolDecoder::new(&encoded);
+        for operation in operations {
+            let matches = match operation {
+                Operation::Bool(probability, value) => decoder.read_bool(probability) == value,
+                Operation::Literal(value, width) => decoder.read_literal(width) == value,
+                Operation::Coefficient(value) => {
+                    decoder.read_tree(&COEFF_TREE, &DEFAULT_COEFF_PROBS[..11]) == value
+                }
+                Operation::LumaMode(value) => {
+                    decoder.read_tree(&KF_Y_MODE_TREE, &KF_Y_MODE_PROBS) == value
+                }
+                Operation::ChromaMode(value) => {
+                    decoder.read_tree(&UV_MODE_TREE, &KF_UV_MODE_PROBS) == value
+                }
+            };
+            assert_eq!(u8::from(matches), 1);
         }
     }
 }

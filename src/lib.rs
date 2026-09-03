@@ -4,9 +4,8 @@
 //! reads and writes byte slices in memory, so the caller owns every path and
 //! file handle. The library is `no_std` and allocates through `alloc`.
 //!
-//! Version 0.0.0 carries the public surface and the checks that guard it. A
-//! call that clears the dimension and buffer checks returns
-//! [`Error::Unimplemented`]. Encoding arrives in 0.1.0.
+//! Version 0.1.0 writes an opaque, lossy WebP stream with DC prediction and a
+//! fixed quantizer chosen from [`Options::quality`].
 //!
 //! [`Options`] is `#[non_exhaustive]`, so build one from its default and
 //! assign the fields that change.
@@ -16,14 +15,10 @@
 //! opts.quality = 90;
 //! opts.alpha = tiny_webp::Alpha::Discard;
 //!
-//! let err = tiny_webp::encode_rgba(&[], 0, 4, &opts).unwrap_err();
-//! assert_eq!(
-//!     err,
-//!     tiny_webp::Error::DimensionsOutOfRange {
-//!         width: 0,
-//!         height: 4
-//!     }
-//! );
+//! let rgba = [128u8; 16];
+//! let webp = tiny_webp::encode_rgba(&rgba, 2, 2, &opts)?;
+//! assert_eq!(&webp[..4], b"RIFF");
+//! # Ok::<(), tiny_webp::Error>(())
 //! ```
 
 #![no_std]
@@ -35,14 +30,15 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
-#[allow(dead_code)]
 mod bool_coder;
-#[cfg_attr(not(test), allow(dead_code))]
+mod color;
+mod frame;
+#[cfg(test)]
+#[path = "../fixtures/generator.rs"]
+mod generator;
 pub(crate) mod prediction;
 mod quantize;
-#[allow(dead_code)]
 mod residual;
-#[cfg_attr(not(test), allow(dead_code))]
 mod transform;
 
 use alloc::vec::Vec;
@@ -71,14 +67,14 @@ pub enum Alpha {
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Filter {
-    /// Derive the level and the sharpness from the quality setting.
+    /// Signal level 0 and sharpness 0 at version 0.1.0.
     #[default]
     Auto,
     /// Signal an exact level and sharpness.
     Level {
-        /// Filter level, 0 through 63.
+        /// Filter level, saturated at 63.
         level: u8,
-        /// Filter sharpness, 0 through 7.
+        /// Filter sharpness, saturated at 7.
         sharpness: u8,
     },
     /// Signal level 0, which leaves the decoder's filter idle.
@@ -92,7 +88,7 @@ pub enum Filter {
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Options {
-    /// Quality from 0 to 100, on the scale cwebp's `-q` uses.
+    /// Quality on cwebp's 0 to 100 scale, with larger values saturated at 100.
     pub quality: u8,
     /// Treatment of the alpha plane.
     pub alpha: Alpha,
@@ -134,11 +130,6 @@ pub enum Error {
         /// Bytes the caller passed.
         actual: usize,
     },
-    /// A well-formed call that 0.0.0 stops short of encoding.
-    ///
-    /// Every call that clears both checks returns this. The variant leaves
-    /// the enum in 0.1.0, when encoding arrives.
-    Unimplemented,
 }
 
 impl fmt::Display for Error {
@@ -154,13 +145,6 @@ impl fmt::Display for Error {
                 write!(
                     f,
                     "buffer holds {actual} bytes and the dimensions ask for {expected}"
-                )
-            }
-            Self::Unimplemented => {
-                write!(
-                    f,
-                    "encoding is not implemented in {}",
-                    env!("CARGO_PKG_VERSION")
                 )
             }
         }
@@ -180,13 +164,17 @@ impl core::error::Error for Error {}
 /// [`MAX_DIMENSION`], carrying the values passed. [`Error::BufferSizeMismatch`]
 /// when `rgba` runs to a length other than `width * height * 4`. The dimension
 /// check runs first, so a call that gets both wrong reports the dimensions.
-///
-/// [`Error::Unimplemented`] for every call that clears both checks.
 pub fn encode_rgba(rgba: &[u8], width: u32, height: u32, opts: &Options) -> Result<Vec<u8>, Error> {
-    // The encoder reads the options from 0.1.0.
-    let _ = opts;
     check(rgba.len(), width, height, 4)?;
-    Err(Error::Unimplemented)
+    Ok(frame::encode(
+        rgba,
+        width as usize,
+        height as usize,
+        4,
+        quantize::quantizer_index(opts.quality),
+        opts.filter,
+    )
+    .webp)
 }
 
 /// Encodes an RGB buffer into the bytes of a WebP file.
@@ -197,13 +185,19 @@ pub fn encode_rgba(rgba: &[u8], width: u32, height: u32, opts: &Options) -> Resu
 ///
 /// # Errors
 ///
-/// The same three errors as [`encode_rgba`], in the same order, with three
+/// The same two errors as [`encode_rgba`], in the same order, with three
 /// bytes per pixel in the length the buffer check asks for.
 pub fn encode_rgb(rgb: &[u8], width: u32, height: u32, opts: &Options) -> Result<Vec<u8>, Error> {
-    // The encoder reads the options from 0.1.0.
-    let _ = opts;
     check(rgb.len(), width, height, 3)?;
-    Err(Error::Unimplemented)
+    Ok(frame::encode(
+        rgb,
+        width as usize,
+        height as usize,
+        3,
+        quantize::quantizer_index(opts.quality),
+        opts.filter,
+    )
+    .webp)
 }
 
 /// Holds the entry-point checks in one place so both spell the same order.
@@ -211,8 +205,7 @@ fn check(actual: usize, width: u32, height: u32, bytes_per_pixel: u64) -> Result
     if width == 0 || height == 0 || width > MAX_DIMENSION || height > MAX_DIMENSION {
         return Err(Error::DimensionsOutOfRange { width, height });
     }
-    // Past the guard both sides sit at 16383 or below, so the product fits in
-    // 32 bits and the cast keeps every value.
+    // 16383 * 16383 * 4 fits in usize on every supported target.
     let expected = (u64::from(width) * u64::from(height) * bytes_per_pixel) as usize;
     if actual != expected {
         return Err(Error::BufferSizeMismatch { expected, actual });

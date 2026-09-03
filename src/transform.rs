@@ -1,9 +1,15 @@
-const DCT_BASIS: [[i32; 4]; 4] = [
+// Each entry is round(65536 * scale * cos((2 * x + 1) * u * pi / 8)).
+// Scale is one half for u = 0 and one over square root of two otherwise.
+pub(crate) const DCT_BASIS: [[i32; 4]; 4] = [
     [32768, 32768, 32768, 32768],
     [42813, 17734, -17734, -42813],
     [32768, -32768, -32768, 32768],
     [17734, -42813, 42813, -17734],
 ];
+
+// RFC 6386 section 14.4 defines these 16.16 inverse DCT constants.
+pub(crate) const COS_PI_8_SQRT_2_MINUS_1: i32 = 20091;
+pub(crate) const SIN_PI_8_SQRT_2: i32 = 35468;
 
 pub(crate) fn inverse_wht(input: &[i32; 16]) -> [i32; 16] {
     let mut output = [0; 16];
@@ -38,9 +44,6 @@ pub(crate) fn inverse_wht(input: &[i32; 16]) -> [i32; 16] {
 }
 
 pub(crate) fn inverse_dct(input: &[i32; 16]) -> [i32; 16] {
-    const COS_PI_8_SQRT_2_MINUS_1: i32 = 20091;
-    const SIN_PI_8_SQRT_2: i32 = 35468;
-
     let mut output = [0; 16];
 
     // RFC 6386 section 14.4 fixes both constants and the final rounding.

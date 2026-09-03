@@ -4,7 +4,7 @@ use std::ffi::{OsStr, OsString};
 use std::process::ExitCode;
 
 use lexopt::prelude::{Long, Short, Value};
-use tiny_webp::{Alpha, Error, Options};
+use tiny_webp::{Alpha, Options};
 
 /// The help text, printed by `-h` and after every usage error.
 ///
@@ -55,10 +55,11 @@ fn main() -> ExitCode {
                 quiet,
                 verbose,
             } = cli;
-            // The 0.1.0 encoder opens these paths and reads these flags. At
-            // 0.0.0 the run stops here, before touching the file system.
             let _ = (input, output, options, quiet, verbose);
-            eprintln!("tiny-webp: {}", Error::Unimplemented);
+            eprintln!(
+                "tiny-webp: encoding is not implemented in {}",
+                env!("CARGO_PKG_VERSION")
+            );
             ExitCode::from(1)
         }
         Err(problem) => {

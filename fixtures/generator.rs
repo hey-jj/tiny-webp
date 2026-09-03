@@ -4,10 +4,14 @@
 //! the fixture name, so the bytes are the same on every target and on every
 //! run. The examples, the benchmark, and the tests all compile this file.
 
+use std::boxed::Box;
 use std::error::Error;
+use std::format;
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
+use std::vec;
+use std::vec::Vec;
 
 /// One generated image, in RGBA order at four bytes per pixel.
 pub struct Fixture {

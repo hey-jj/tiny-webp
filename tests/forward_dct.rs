@@ -5,6 +5,23 @@ mod transform;
 
 use std::f64::consts::{FRAC_1_SQRT_2, PI};
 
+#[test]
+fn every_fixed_point_transform_constant_regenerates_from_its_expression() {
+    let basis = core::array::from_fn(|frequency| {
+        core::array::from_fn(|position| {
+            let scale = if frequency == 0 { 0.5 } else { FRAC_1_SQRT_2 };
+            let angle = (2 * position + 1) as f64 * frequency as f64 * PI / 8.0;
+            (65536.0 * scale * angle.cos()).round() as i32
+        })
+    });
+    let inverse_cosine = (65536.0 * (2.0f64.sqrt() * (PI / 8.0).cos() - 1.0)).round() as i32;
+    let inverse_sine = (65536.0 * 2.0f64.sqrt() * (PI / 8.0).sin()).round() as i32;
+
+    assert_eq!(basis, transform::DCT_BASIS);
+    assert_eq!(inverse_cosine, transform::COS_PI_8_SQRT_2_MINUS_1);
+    assert_eq!(inverse_sine, transform::SIN_PI_8_SQRT_2);
+}
+
 fn real_forward_dct(input: &[i32; 16]) -> [i32; 16] {
     let mut output = [0; 16];
     for vertical in 0..4 {

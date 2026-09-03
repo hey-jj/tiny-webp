@@ -25,7 +25,7 @@ const TOKEN_CATEGORY_SIX: u8 = 10;
 const TOKEN_END: u8 = 11;
 
 // RFC 6386 section 13.2 defines the coefficient token tree.
-const COEFF_TREE: [i8; 22] = [
+pub(crate) const COEFF_TREE: [i8; 22] = [
     -11, 2, 0, 4, -1, 6, 8, 12, -2, 10, -3, -4, 14, 16, -5, -6, 18, 20, -7, -8, -9, -10,
 ];
 

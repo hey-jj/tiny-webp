@@ -33,6 +33,7 @@ png = { version = "0.18", optional = true }
 
 [dev-dependencies]
 criterion = "0.7"
+image-webp = "0.2.4"
 
 [[bin]]
 name = "tiny-webp"

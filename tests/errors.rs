@@ -34,14 +34,3 @@ fn the_buffer_text_names_the_count_that_arrived_and_the_count_the_dimensions_ask
         "buffer holds 79 bytes and the dimensions ask for 80"
     );
 }
-
-#[test]
-fn the_unimplemented_text_names_the_crate_version() {
-    assert_eq!(
-        Error::Unimplemented.to_string(),
-        format!(
-            "encoding is not implemented in {}",
-            env!("CARGO_PKG_VERSION")
-        )
-    );
-}
