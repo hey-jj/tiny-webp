@@ -38,6 +38,7 @@ extern crate std;
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod prediction;
+mod quantize;
 
 use alloc::vec::Vec;
 use core::fmt;
