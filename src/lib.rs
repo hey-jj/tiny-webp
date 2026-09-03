@@ -33,6 +33,12 @@
 
 extern crate alloc;
 
+#[cfg(test)]
+extern crate std;
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod prediction;
+
 use alloc::vec::Vec;
 use core::fmt;
 
