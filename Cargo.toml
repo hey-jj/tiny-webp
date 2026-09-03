@@ -25,10 +25,11 @@ include = [
 [features]
 default = ["std", "cli"]
 std = []
-cli = ["std", "dep:lexopt"]
+cli = ["std", "dep:lexopt", "dep:png"]
 
 [dependencies]
 lexopt = { version = "0.3", optional = true }
+png = { version = "0.18", optional = true }
 
 [dev-dependencies]
 criterion = "0.7"

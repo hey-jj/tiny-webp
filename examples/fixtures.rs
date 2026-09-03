@@ -1,9 +1,19 @@
-//! Prints the fixture table.
+//! Prints the fixture table or writes it as PNG files.
 
 #[path = "../fixtures/generator.rs"]
 mod generator;
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(directory) = std::env::args_os().nth(1) {
+        generator::write_all(std::path::Path::new(&directory))?;
+    } else {
+        print_table();
+    }
+    Ok(())
+}
+
+/// Prints one table row for every fixture.
+fn print_table() {
     for fixture in generator::all() {
         let transparent = fixture
             .rgba

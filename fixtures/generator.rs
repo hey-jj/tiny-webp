@@ -4,6 +4,11 @@
 //! the fixture name, so the bytes are the same on every target and on every
 //! run. The examples, the benchmark, and the tests all compile this file.
 
+use std::error::Error;
+use std::fs::File;
+use std::io::BufWriter;
+use std::path::Path;
+
 /// One generated image, in RGBA order at four bytes per pixel.
 pub struct Fixture {
     /// The name the formula is seeded from and the reports print.
@@ -23,17 +28,73 @@ pub struct Fixture {
 /// 33x1, and 17x31.
 pub fn all() -> Vec<Fixture> {
     vec![
+        flat("flat", 32, 32),
+        checker("checker", 32, 32),
         gradient("gradient", 64, 48),
         text_blocks("text-blocks", 64, 48),
         noise("noise", 64, 48),
         lowpass_noise("lowpass-noise", 64, 48),
         soft_alpha("alpha-soft", 64, 48),
         hard_alpha("alpha-hard", 64, 48),
+        soft_alpha("alpha-odd", 17, 31),
+        lowpass_noise("photo-large", 1024, 768),
         gradient("one-pixel", 1, 1),
         gradient("single-column", 1, 33),
         gradient("single-row", 33, 1),
         text_blocks("odd-size", 17, 31),
     ]
+}
+
+/// Writes every fixture as an RGBA8 PNG file.
+///
+/// # Errors
+///
+/// Returns the file or PNG error that stopped the write.
+// The benchmark compiles this shared file and calls only the generator.
+#[allow(dead_code)]
+pub fn write_all(directory: &Path) -> Result<(), Box<dyn Error>> {
+    std::fs::create_dir_all(directory)?;
+    for fixture in all() {
+        let path = directory.join(format!("{}.png", fixture.name));
+        let output = BufWriter::new(File::create(path)?);
+        let mut encoder = png::Encoder::new(output, fixture.width, fixture.height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header()?;
+        writer.write_image_data(&fixture.rgba)?;
+    }
+    Ok(())
+}
+
+/// One opaque color across the whole image.
+fn flat(name: &'static str, width: u32, height: u32) -> Fixture {
+    let mut rgba = Vec::with_capacity(pixel_bytes(width, height));
+    for _ in 0..width * height {
+        rgba.extend_from_slice(&[96, 128, 160, 255]);
+    }
+    Fixture {
+        name,
+        width,
+        height,
+        rgba,
+    }
+}
+
+/// Black and white squares whose sides span two pixels.
+fn checker(name: &'static str, width: u32, height: u32) -> Fixture {
+    let mut rgba = Vec::with_capacity(pixel_bytes(width, height));
+    for y in 0..height {
+        for x in 0..width {
+            let value = if (x / 2 + y / 2) % 2 == 0 { 0 } else { 255 };
+            rgba.extend_from_slice(&[value, value, value, 255]);
+        }
+    }
+    Fixture {
+        name,
+        width,
+        height,
+        rgba,
+    }
 }
 
 /// A linear ramp on each axis with a full alpha plane.
@@ -77,7 +138,7 @@ fn text_blocks(name: &'static str, width: u32, height: u32) -> Fixture {
     }
 }
 
-/// An independent value in every colour byte.
+/// An independent value in every color byte.
 fn noise(name: &'static str, width: u32, height: u32) -> Fixture {
     let mut rng = Rng::seeded(name);
     let mut rgba = Vec::with_capacity(pixel_bytes(width, height));
@@ -123,10 +184,10 @@ fn lowpass_noise(name: &'static str, width: u32, height: u32) -> Fixture {
     }
 }
 
-/// A gradient under an alpha plane that falls off from the centre.
+/// A gradient under an alpha plane that falls off from the center.
 fn soft_alpha(name: &'static str, width: u32, height: u32) -> Fixture {
     let mut fixture = gradient(name, width, height);
-    // Coordinates are doubled so the centre of an even-sided image lands on a
+    // Coordinates are doubled so the center of an even-sided image lands on a
     // whole number.
     let span_x = i64::from(width) - 1;
     let span_y = i64::from(height) - 1;
@@ -161,7 +222,7 @@ fn hard_alpha(name: &'static str, width: u32, height: u32) -> Fixture {
     fixture
 }
 
-/// Averages each sample with its eight neighbours, clamping at the edges.
+/// Averages each sample with its eight neighbors, clamping at the edges.
 fn blur(plane: &[u8], width: u32, height: u32) -> Vec<u8> {
     let mut out = Vec::with_capacity(plane.len());
     let last_x = i64::from(width) - 1;
