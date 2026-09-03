@@ -52,8 +52,8 @@ pub(crate) fn encode(
     write_frame_header(&mut first_partition, quantizer_index, options.filter);
     for macroblock_y in 0..macroblock_rows {
         for macroblock_x in 0..macroblock_columns {
-            first_partition.write_tree(&KF_Y_MODE_TREE, &KF_Y_MODE_PROBS, DC_MODE);
-            first_partition.write_tree(&UV_MODE_TREE, &KF_UV_MODE_PROBS, DC_MODE);
+            first_partition.write_tree(&KF_Y_MODE_TREE, &KF_Y_MODE_PROBS, DC_MODE, 0);
+            first_partition.write_tree(&UV_MODE_TREE, &KF_UV_MODE_PROBS, DC_MODE, 0);
 
             let luma_prediction = predict_luma_dc(
                 &reconstruction.y,
@@ -397,7 +397,7 @@ mod tests {
         struct Trace(alloc::vec::Vec<(u8, bool)>);
 
         let mut encoder = BoolEncoder::new();
-        encoder.write_tree(tree, probabilities, value);
+        encoder.write_tree(tree, probabilities, value, 0);
         let bytes = encoder.finish();
         let mut decoder = crate::bool_coder::BoolDecoder::new(&bytes);
         let mut node = 0usize;
@@ -445,7 +445,7 @@ mod tests {
     }
 
     #[test]
-    fn an_opaque_file_carries_one_padded_vp8_chunk_with_the_ruled_frame_fields() {
+    fn an_opaque_file_carries_one_padded_vp8_chunk_with_the_frame_fields() {
         let pixels = [
             0, 32, 64, 96, 128, 160, 192, 224, 255, 17, 34, 51, 68, 85, 102, 119, 136, 153,
         ];
@@ -495,8 +495,8 @@ mod tests {
             assert_eq!(u8::from(header.read_bool(probability)), 0);
         }
         assert_eq!(header.read_literal(1), 0);
-        assert_eq!(header.read_tree(&KF_Y_MODE_TREE, &KF_Y_MODE_PROBS), 0);
-        assert_eq!(header.read_tree(&UV_MODE_TREE, &KF_UV_MODE_PROBS), 0);
+        assert_eq!(header.read_tree(&KF_Y_MODE_TREE, &KF_Y_MODE_PROBS, 0), 0);
+        assert_eq!(header.read_tree(&UV_MODE_TREE, &KF_UV_MODE_PROBS, 0), 0);
     }
 
     #[test]
@@ -575,8 +575,8 @@ mod tests {
         let mut partition = BoolEncoder::with_capacity(524_288);
         write_frame_header(&mut partition, 0, Filter::Off);
         for _ in 0..macroblock_count {
-            partition.write_tree(&KF_Y_MODE_TREE, &KF_Y_MODE_PROBS, DC_MODE);
-            partition.write_tree(&UV_MODE_TREE, &KF_UV_MODE_PROBS, DC_MODE);
+            partition.write_tree(&KF_Y_MODE_TREE, &KF_Y_MODE_PROBS, DC_MODE, 0);
+            partition.write_tree(&UV_MODE_TREE, &KF_UV_MODE_PROBS, DC_MODE, 0);
         }
         let partition_size = partition.finish().len();
         assert_eq!(partition_size, 449_397);
@@ -784,19 +784,14 @@ mod tests {
     }
 
     #[test]
-    fn reconstruction_matches_dwebp_for_every_fixture_quality_and_ruled_index() {
+    fn reconstruction_matches_dwebp_for_every_fixture_quality_and_index() {
         if !oracle_is_available("dwebp") {
             return;
         }
         let directory = scratch_directory("reconstruction_matches_dwebp");
         for fixture in generator::all() {
             for quality in [0u8, 25, 50, 75, 90, 95, 100] {
-                assert_reconstruction(
-                    &directory,
-                    &fixture,
-                    quantizer_index(quality),
-                    &format!("{} q{quality}", fixture.name),
-                );
+                assert_reconstruction(&directory, &fixture, quantizer_index(quality));
             }
         }
         for name in ["gradient", "noise"] {
@@ -806,10 +801,18 @@ mod tests {
                 .find(|fixture| fixture.name == name)
                 .expect("find the indexed fixture");
             for index in 0..=127u8 {
-                assert_reconstruction(&directory, fixture, index, &format!("{name} index {index}"));
+                assert_reconstruction(&directory, fixture, index);
             }
         }
         fs::remove_dir_all(directory).expect("remove the test directory");
+    }
+
+    #[test]
+    fn a_reconstruction_difference_names_its_fixture_index_plane_row_and_column() {
+        assert_eq!(
+            reconstruction_difference_message("flat", 26, "U", 3, 7),
+            "fixture flat, quantizer index 26, plane U, first differing row 3, column 7"
+        );
     }
 
     #[test]
@@ -886,12 +889,7 @@ mod tests {
         (reader.info().width, reader.info().height)
     }
 
-    fn assert_reconstruction(
-        directory: &Path,
-        fixture: &generator::Fixture,
-        index: u8,
-        case: &str,
-    ) {
+    fn assert_reconstruction(directory: &Path, fixture: &generator::Fixture, index: u8) {
         let options = Options {
             filter: Filter::Off,
             ..Options::default()
@@ -915,27 +913,93 @@ mod tests {
             .arg(&output)
             .status()
             .expect("run dwebp");
-        assert_eq!(u8::from(status.success()), 1, "{case}");
+        assert_eq!(
+            u8::from(status.success()),
+            1,
+            "fixture {}, quantizer index {index}",
+            fixture.name
+        );
         let decoded = fs::read(output).expect("read the decoded YUV planes");
-        let mut expected = Vec::with_capacity(decoded.len());
-        for row in 0..fixture.height as usize {
-            let start = row * encoded.reconstruction.y_stride;
-            expected.extend_from_slice(
-                &encoded.reconstruction.y[start..start + fixture.width as usize],
-            );
-        }
+        let width = fixture.width as usize;
+        let height = fixture.height as usize;
         let chroma_width = (fixture.width as usize).div_ceil(2);
         let chroma_height = (fixture.height as usize).div_ceil(2);
-        for plane in [&encoded.reconstruction.u, &encoded.reconstruction.v] {
-            for row in 0..chroma_height {
-                let start = row * encoded.reconstruction.chroma_stride;
-                expected.extend_from_slice(&plane[start..start + chroma_width]);
+        let y_length = width * height;
+        let chroma_length = chroma_width * chroma_height;
+        assert_plane_matches(
+            fixture,
+            index,
+            "Y",
+            &encoded.reconstruction.y,
+            encoded.reconstruction.y_stride,
+            &decoded[..y_length],
+            (width, height),
+        );
+        assert_plane_matches(
+            fixture,
+            index,
+            "U",
+            &encoded.reconstruction.u,
+            encoded.reconstruction.chroma_stride,
+            &decoded[y_length..y_length + chroma_length],
+            (chroma_width, chroma_height),
+        );
+        assert_plane_matches(
+            fixture,
+            index,
+            "V",
+            &encoded.reconstruction.v,
+            encoded.reconstruction.chroma_stride,
+            &decoded[y_length + chroma_length..y_length + 2 * chroma_length],
+            (chroma_width, chroma_height),
+        );
+        if has_nonopaque_alpha(&fixture.rgba) {
+            let alpha = alpha_bytes(&fixture.rgba);
+            assert_plane_matches(
+                fixture,
+                index,
+                "A",
+                &alpha,
+                width,
+                &decoded[y_length + 2 * chroma_length..],
+                (width, height),
+            );
+        }
+    }
+
+    fn assert_plane_matches(
+        fixture: &generator::Fixture,
+        index: u8,
+        plane: &str,
+        reconstruction: &[u8],
+        reconstruction_stride: usize,
+        decoded: &[u8],
+        dimensions: (usize, usize),
+    ) {
+        let (width, height) = dimensions;
+        for row in 0..height {
+            for column in 0..width {
+                let decoded_value = decoded[row * width + column];
+                let reconstruction_value = reconstruction[row * reconstruction_stride + column];
+                if decoded_value != reconstruction_value {
+                    let message =
+                        reconstruction_difference_message(fixture.name, index, plane, row, column);
+                    assert_eq!(decoded_value, reconstruction_value, "{message}");
+                }
             }
         }
-        if has_nonopaque_alpha(&fixture.rgba) {
-            expected.extend(alpha_bytes(&fixture.rgba));
-        }
-        assert_eq!(decoded, expected, "{case}");
+    }
+
+    fn reconstruction_difference_message(
+        fixture: &str,
+        index: u8,
+        plane: &str,
+        row: usize,
+        column: usize,
+    ) -> std::string::String {
+        format!(
+            "fixture {fixture}, quantizer index {index}, plane {plane}, first differing row {row}, column {column}"
+        )
     }
 
     fn read_quantizer_index(webp: &[u8]) -> u8 {

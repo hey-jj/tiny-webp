@@ -285,7 +285,7 @@ mod tests {
     }
 
     #[test]
-    fn forward_transform_coefficients_reach_the_ruled_bounds() {
+    fn forward_transform_coefficients_reach_the_stated_bounds() {
         let mut largest_dct = 0;
         let mut largest_wht = 0;
         for signs in 0..=u16::MAX {

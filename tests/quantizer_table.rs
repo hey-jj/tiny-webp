@@ -1,4 +1,4 @@
-//! The checked-in quality table follows its ruled formula.
+//! The checked-in quality table regenerates from its formula.
 
 #[path = "../src/quantize.rs"]
 mod quantize;

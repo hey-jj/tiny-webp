@@ -56,15 +56,16 @@ impl BoolEncoder {
         }
     }
 
-    pub(crate) fn write_tree(&mut self, tree: &[i8], probabilities: &[u8], value: u8) {
-        let mut path = [false; MAX_TREE_DEPTH];
-        let path_len = find_tree_path(tree, 0, value, &mut path, 0)
-            .expect("the value must be a leaf in the tree");
-        let mut node = 0usize;
-
-        for branch in path.into_iter().take(path_len) {
-            self.write_bool(probabilities[node >> 1], branch);
-            node = tree[node + usize::from(branch)] as usize;
+    pub(crate) fn write_tree(
+        &mut self,
+        tree: &[i8],
+        probabilities: &[u8],
+        value: u8,
+        start_node: usize,
+    ) {
+        let (writes, write_count) = tree_writes(tree, probabilities, value, start_node);
+        for (probability, branch) in writes.into_iter().take(write_count) {
+            self.write_bool(probability, branch);
         }
     }
 
@@ -99,6 +100,25 @@ impl BoolEncoder {
         }
         unreachable!("the coded value stays below one");
     }
+}
+
+pub(crate) fn tree_writes(
+    tree: &[i8],
+    probabilities: &[u8],
+    value: u8,
+    start_node: usize,
+) -> ([(u8, bool); MAX_TREE_DEPTH], usize) {
+    let mut path = [false; MAX_TREE_DEPTH];
+    let path_len = find_tree_path(tree, start_node, value, &mut path, 0)
+        .expect("the value must be a leaf in the tree");
+    let mut writes = [(0, false); MAX_TREE_DEPTH];
+    let mut node = start_node;
+
+    for (index, branch) in path.into_iter().take(path_len).enumerate() {
+        writes[index] = (probabilities[node >> 1], branch);
+        node = tree[node + usize::from(branch)] as usize;
+    }
+    (writes, path_len)
 }
 
 fn find_tree_path(
@@ -177,8 +197,8 @@ impl<'a> BoolDecoder<'a> {
         value
     }
 
-    pub(crate) fn read_tree(&mut self, tree: &[i8], probabilities: &[u8]) -> u8 {
-        let mut node = 0usize;
+    pub(crate) fn read_tree(&mut self, tree: &[i8], probabilities: &[u8], start_node: usize) -> u8 {
+        let mut node = start_node;
         loop {
             let branch = usize::from(self.read_bool(probabilities[node >> 1]));
             let child = tree[node + branch];
@@ -306,12 +326,12 @@ mod tests {
         let probabilities = [37, 128, 241];
         let mut encoder = BoolEncoder::new();
         for value in [0, 1, 2, 3] {
-            encoder.write_tree(&tree, &probabilities, value);
+            encoder.write_tree(&tree, &probabilities, value, 0);
         }
         let encoded = encoder.finish();
         let mut decoder = BoolDecoder::new(&encoded);
         for value in [0, 1, 2, 3] {
-            assert_eq!(decoder.read_tree(&tree, &probabilities), value);
+            assert_eq!(decoder.read_tree(&tree, &probabilities, 0), value);
         }
     }
 
@@ -335,13 +355,13 @@ mod tests {
                 Operation::Bool(probability, value) => encoder.write_bool(probability, value),
                 Operation::Literal(value, width) => encoder.write_literal(value, width),
                 Operation::Coefficient(value) => {
-                    encoder.write_tree(&COEFF_TREE, &DEFAULT_COEFF_PROBS[..11], value)
+                    encoder.write_tree(&COEFF_TREE, &DEFAULT_COEFF_PROBS[..11], value, 0)
                 }
                 Operation::LumaMode(value) => {
-                    encoder.write_tree(&KF_Y_MODE_TREE, &KF_Y_MODE_PROBS, value)
+                    encoder.write_tree(&KF_Y_MODE_TREE, &KF_Y_MODE_PROBS, value, 0)
                 }
                 Operation::ChromaMode(value) => {
-                    encoder.write_tree(&UV_MODE_TREE, &KF_UV_MODE_PROBS, value)
+                    encoder.write_tree(&UV_MODE_TREE, &KF_UV_MODE_PROBS, value, 0)
                 }
             }
         }
@@ -353,13 +373,13 @@ mod tests {
                 Operation::Bool(probability, value) => decoder.read_bool(probability) == value,
                 Operation::Literal(value, width) => decoder.read_literal(width) == value,
                 Operation::Coefficient(value) => {
-                    decoder.read_tree(&COEFF_TREE, &DEFAULT_COEFF_PROBS[..11]) == value
+                    decoder.read_tree(&COEFF_TREE, &DEFAULT_COEFF_PROBS[..11], 0) == value
                 }
                 Operation::LumaMode(value) => {
-                    decoder.read_tree(&KF_Y_MODE_TREE, &KF_Y_MODE_PROBS) == value
+                    decoder.read_tree(&KF_Y_MODE_TREE, &KF_Y_MODE_PROBS, 0) == value
                 }
                 Operation::ChromaMode(value) => {
-                    decoder.read_tree(&UV_MODE_TREE, &KF_UV_MODE_PROBS) == value
+                    decoder.read_tree(&UV_MODE_TREE, &KF_UV_MODE_PROBS, 0) == value
                 }
             };
             assert_eq!(u8::from(matches), 1);

@@ -311,7 +311,7 @@ fn write_block<W: EntropyWriter>(
     let mut previous_was_zero = false;
     for position in first_position..=last_nonzero {
         let level = levels[ZIGZAG[position]];
-        let magnitude = level.unsigned_abs();
+        let magnitude = level.unsigned_abs().min(2114);
         let token = token_for_magnitude(magnitude);
         write_token(writer, token, plane, position, context, previous_was_zero);
         if magnitude != 0 {
@@ -338,7 +338,7 @@ fn write_token<W: EntropyWriter>(
 ) {
     let probabilities = coefficient_probabilities(plane, COEFF_BANDS[position], context);
     let start_node = if skip_end_branch { 2 } else { 0 };
-    writer.write_tree_from(&COEFF_TREE, probabilities, token, start_node);
+    writer.write_tree(&COEFF_TREE, probabilities, token, start_node);
 }
 
 fn write_extra_bits<W: EntropyWriter>(writer: &mut W, magnitude: u16, token: u8) {
@@ -391,7 +391,7 @@ fn coefficient_probabilities(plane: usize, band: usize, context: usize) -> &'sta
 trait EntropyWriter {
     fn write_bool(&mut self, probability: u8, value: bool);
 
-    fn write_tree_from(&mut self, tree: &[i8], probabilities: &[u8], value: u8, start_node: usize);
+    fn write_tree(&mut self, tree: &[i8], probabilities: &[u8], value: u8, start_node: usize);
 }
 
 impl EntropyWriter for BoolEncoder {
@@ -399,42 +399,9 @@ impl EntropyWriter for BoolEncoder {
         BoolEncoder::write_bool(self, probability, value);
     }
 
-    fn write_tree_from(&mut self, tree: &[i8], probabilities: &[u8], value: u8, start_node: usize) {
-        if start_node == 0 {
-            BoolEncoder::write_tree(self, tree, probabilities, value);
-            return;
-        }
-
-        let mut path = [false; TREE_NODE_COUNT];
-        let path_len = find_tree_path(tree, start_node, value, &mut path, 0)
-            .expect("the token must be in the coefficient tree");
-        let mut node = start_node;
-        for branch in path.into_iter().take(path_len) {
-            self.write_bool(probabilities[node >> 1], branch);
-            node = tree[node + usize::from(branch)] as usize;
-        }
+    fn write_tree(&mut self, tree: &[i8], probabilities: &[u8], value: u8, start_node: usize) {
+        BoolEncoder::write_tree(self, tree, probabilities, value, start_node);
     }
-}
-
-fn find_tree_path(
-    tree: &[i8],
-    node: usize,
-    value: u8,
-    path: &mut [bool; TREE_NODE_COUNT],
-    depth: usize,
-) -> Option<usize> {
-    for branch in [false, true] {
-        let child = tree[node + usize::from(branch)];
-        path[depth] = branch;
-        if child <= 0 {
-            if child.unsigned_abs() == value {
-                return Some(depth + 1);
-            }
-        } else if let Some(length) = find_tree_path(tree, child as usize, value, path, depth + 1) {
-            return Some(length);
-        }
-    }
-    None
 }
 
 #[cfg(test)]
@@ -478,6 +445,7 @@ mod tests {
         left_u: [bool; 2],
         left_v: [bool; 2],
         left_y2: bool,
+        first_contexts_seen: [bool; 3],
     }
 
     impl ResidualReader {
@@ -491,6 +459,7 @@ mod tests {
                 left_u: [false; 2],
                 left_v: [false; 2],
                 left_y2: false,
+                first_contexts_seen: [false; 3],
             }
         }
 
@@ -508,6 +477,7 @@ mod tests {
 
             let mut residual = MacroblockResidual::default();
             let y2_context = usize::from(self.left_y2) + usize::from(self.above_y2[macroblock_x]);
+            self.first_contexts_seen[y2_context] = true;
             let (y2, y2_has_coefficients) = read_block(decoder, PLANE_Y2, 0, y2_context);
             residual.y2 = y2;
             self.left_y2 = y2_has_coefficients;
@@ -516,6 +486,7 @@ mod tests {
             read_plane_blocks(
                 decoder,
                 &mut residual.y,
+                &mut self.first_contexts_seen,
                 PlaneContext {
                     blocks_wide: 4,
                     above: &mut self.above_y,
@@ -528,6 +499,7 @@ mod tests {
             read_plane_blocks(
                 decoder,
                 &mut residual.u,
+                &mut self.first_contexts_seen,
                 PlaneContext {
                     blocks_wide: 2,
                     above: &mut self.above_u,
@@ -540,6 +512,7 @@ mod tests {
             read_plane_blocks(
                 decoder,
                 &mut residual.v,
+                &mut self.first_contexts_seen,
                 PlaneContext {
                     blocks_wide: 2,
                     above: &mut self.above_v,
@@ -569,6 +542,7 @@ mod tests {
     fn read_plane_blocks(
         decoder: &mut BoolDecoder<'_>,
         blocks: &mut [[i16; 16]],
+        first_contexts_seen: &mut [bool; 3],
         context: PlaneContext<'_>,
     ) {
         for (block_index, block) in blocks.iter_mut().enumerate() {
@@ -576,6 +550,7 @@ mod tests {
             let block_y = block_index / context.blocks_wide;
             let neighbor_count = usize::from(context.left[block_y])
                 + usize::from(context.above[context.above_start + block_x]);
+            first_contexts_seen[neighbor_count] = true;
             let (decoded, has_coefficients) = read_block(
                 decoder,
                 context.plane,
@@ -629,15 +604,8 @@ mod tests {
         skip_end_branch: bool,
     ) -> u8 {
         let probabilities = coefficient_probabilities(plane, COEFF_BANDS[position], context);
-        let mut node = if skip_end_branch { 2 } else { 0 };
-        loop {
-            let branch = usize::from(decoder.read_bool(probabilities[node >> 1]));
-            let child = COEFF_TREE[node + branch];
-            if child <= 0 {
-                return child.unsigned_abs();
-            }
-            node = child as usize;
-        }
+        let start_node = if skip_end_branch { 2 } else { 0 };
+        decoder.read_tree(&COEFF_TREE, probabilities, start_node)
     }
 
     fn read_magnitude(decoder: &mut BoolDecoder<'_>, token: u8) -> u16 {
@@ -672,21 +640,10 @@ mod tests {
             self.writes.push((probability, value));
         }
 
-        fn write_tree_from(
-            &mut self,
-            tree: &[i8],
-            probabilities: &[u8],
-            value: u8,
-            start_node: usize,
-        ) {
-            let mut path = [false; TREE_NODE_COUNT];
-            let length = find_tree_path(tree, start_node, value, &mut path, 0)
-                .expect("the token is a tree leaf");
-            let mut node = start_node;
-            for branch in path.into_iter().take(length) {
-                self.write_bool(probabilities[node >> 1], branch);
-                node = tree[node + usize::from(branch)] as usize;
-            }
+        fn write_tree(&mut self, tree: &[i8], probabilities: &[u8], value: u8, start_node: usize) {
+            let (writes, write_count) =
+                crate::bool_coder::tree_writes(tree, probabilities, value, start_node);
+            self.writes.extend_from_slice(&writes[..write_count]);
         }
     }
 
@@ -722,16 +679,20 @@ mod tests {
         }
     }
 
-    fn seeded_macroblock(sparsity: usize, seed: &mut u32) -> MacroblockResidual {
+    fn seeded_macroblock(seed: &mut u32) -> MacroblockResidual {
         let mut residual = MacroblockResidual::default();
+        let sparsity = next_seed(seed) as usize % 17;
         fill_block(&mut residual.y2, 0, sparsity, seed);
         for block in &mut residual.y {
+            let sparsity = next_seed(seed) as usize % 17;
             fill_block(block, 1, sparsity, seed);
         }
         for block in &mut residual.u {
+            let sparsity = next_seed(seed) as usize % 17;
             fill_block(block, 0, sparsity, seed);
         }
         for block in &mut residual.v {
+            let sparsity = next_seed(seed) as usize % 17;
             fill_block(block, 0, sparsity, seed);
         }
         residual
@@ -837,10 +798,16 @@ mod tests {
         ];
         let actual: Vec<Vec<bool>> = (TOKEN_ZERO..=TOKEN_END)
             .map(|token| {
-                let mut path = [false; TREE_NODE_COUNT];
-                let length = find_tree_path(&COEFF_TREE, 0, token, &mut path, 0)
-                    .expect("each token is a leaf");
-                path[..length].to_vec()
+                let (writes, write_count) = crate::bool_coder::tree_writes(
+                    &COEFF_TREE,
+                    &DEFAULT_COEFF_PROBS[..TREE_NODE_COUNT],
+                    token,
+                    0,
+                );
+                writes[..write_count]
+                    .iter()
+                    .map(|(_, branch)| *branch)
+                    .collect()
             })
             .collect();
         assert_eq!(actual, expected);
@@ -857,38 +824,53 @@ mod tests {
     }
 
     #[test]
-    fn every_seeded_macroblock_sequence_reads_back_at_each_sparsity() {
+    fn magnitudes_above_2114_saturate_at_2114() {
+        let mut levels = [0; 16];
+        levels[0] = i16::MAX;
+        levels[1] = i16::MIN;
+        let mut encoder = BoolEncoder::new();
+        assert_eq!(
+            u8::from(write_block(&mut encoder, &levels, PLANE_CHROMA, 0, 0)),
+            1
+        );
+        let encoded = encoder.finish();
+        let mut decoder = BoolDecoder::new(&encoded);
+        let (decoded, has_coefficients) = read_block(&mut decoder, PLANE_CHROMA, 0, 0);
+        let mut expected = [0; 16];
+        expected[0] = 2114;
+        expected[1] = -2114;
+        assert_eq!((decoded, has_coefficients), (expected, true));
+    }
+
+    #[test]
+    fn every_seeded_macroblock_sequence_reads_back_with_all_first_contexts() {
         const COLUMNS: usize = 5;
-        const MACROBLOCKS: usize = COLUMNS * 4;
+        const MACROBLOCKS: usize = COLUMNS * 20;
 
-        for sparsity in 0..=16 {
-            let mut seed = 0x6d2b_79f5u32 ^ sparsity as u32;
-            let expected: Vec<_> = (0..MACROBLOCKS)
-                .map(|_| seeded_macroblock(sparsity, &mut seed))
-                .collect();
-            let mut encoder = BoolEncoder::new();
-            let mut writer = ResidualWriter::new(COLUMNS);
-            let mut states = Vec::with_capacity(MACROBLOCKS);
-            for (index, residual) in expected.iter().enumerate() {
-                writer.write_macroblock(&mut encoder, index % COLUMNS, residual);
-                states.push(ContextState::from(&writer));
-            }
-
-            let encoded = encoder.finish();
-            let mut decoder = BoolDecoder::new(&encoded);
-            let mut reader = ResidualReader::new(COLUMNS);
-            for (index, residual) in expected.iter().enumerate() {
-                let decoded = reader.read_macroblock(&mut decoder, index % COLUMNS);
-                assert_eq!(
-                    decoded, *residual,
-                    "sparsity {sparsity}, macroblock {index}"
-                );
-                assert_eq!(
-                    reader.state(),
-                    states[index],
-                    "sparsity {sparsity}, context after macroblock {index}"
-                );
-            }
+        let mut seed = 0x6d2b_79f5u32;
+        let expected: Vec<_> = (0..MACROBLOCKS)
+            .map(|_| seeded_macroblock(&mut seed))
+            .collect();
+        let mut encoder = BoolEncoder::new();
+        let mut writer = ResidualWriter::new(COLUMNS);
+        let mut states = Vec::with_capacity(MACROBLOCKS);
+        for (index, residual) in expected.iter().enumerate() {
+            writer.write_macroblock(&mut encoder, index % COLUMNS, residual);
+            states.push(ContextState::from(&writer));
         }
+
+        let encoded = encoder.finish();
+        let mut decoder = BoolDecoder::new(&encoded);
+        let mut reader = ResidualReader::new(COLUMNS);
+        for (index, residual) in expected.iter().enumerate() {
+            let decoded = reader.read_macroblock(&mut decoder, index % COLUMNS);
+            assert_eq!(decoded, *residual, "macroblock {index}");
+            assert_eq!(
+                reader.state(),
+                states[index],
+                "context after macroblock {index}"
+            );
+        }
+        assert_eq!(reader.first_contexts_seen, [true; 3]);
     }
 }
