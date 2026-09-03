@@ -821,7 +821,12 @@ mod tests {
             return;
         }
         let directory = scratch_directory("cwebp_quality_indices");
-        generator::write_all(&directory).expect("write the fixture PNG files");
+        let fixtures = generator::all();
+        let fixture = fixtures
+            .iter()
+            .find(|fixture| fixture.name == "gradient")
+            .expect("find the gradient fixture");
+        write_png(&directory.join("gradient.png"), fixture);
         let input = directory.join("gradient.png");
         let output = directory.join("output.webp");
         for (quality, expected) in Q_TO_INDEX.iter().enumerate() {
@@ -883,10 +888,23 @@ mod tests {
     }
 
     fn png_dimensions(path: &Path) -> (u32, u32) {
-        let input = fs::File::open(path).expect("open the decoded PNG");
-        let decoder = png::Decoder::new(std::io::BufReader::new(input));
-        let reader = decoder.read_info().expect("read the decoded PNG header");
-        (reader.info().width, reader.info().height)
+        let bytes = fs::read(path).expect("read the decoded PNG header");
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+        assert_eq!(&bytes[12..16], b"IHDR");
+        let width = u32::from_be_bytes(bytes[16..20].try_into().expect("PNG width bytes"));
+        let height = u32::from_be_bytes(bytes[20..24].try_into().expect("PNG height bytes"));
+        (width, height)
+    }
+
+    fn write_png(path: &Path, fixture: &generator::Fixture) {
+        let output = std::io::BufWriter::new(fs::File::create(path).expect("create the PNG file"));
+        let mut encoder = png::Encoder::new(output, fixture.width, fixture.height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().expect("write the PNG header");
+        writer
+            .write_image_data(&fixture.rgba)
+            .expect("write the PNG pixels");
     }
 
     fn assert_reconstruction(directory: &Path, fixture: &generator::Fixture, index: u8) {

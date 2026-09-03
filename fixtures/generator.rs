@@ -4,12 +4,6 @@
 //! the fixture name, so the bytes are the same on every target and on every
 //! run. The examples, the benchmark, and the tests all compile this file.
 
-use std::boxed::Box;
-use std::error::Error;
-use std::format;
-use std::fs::File;
-use std::io::BufWriter;
-use std::path::Path;
 use std::vec;
 use std::vec::Vec;
 
@@ -47,27 +41,6 @@ pub fn all() -> Vec<Fixture> {
         gradient("single-row", 33, 1),
         text_blocks("odd-size", 17, 31),
     ]
-}
-
-/// Writes every fixture as an RGBA8 PNG file.
-///
-/// # Errors
-///
-/// Returns the file or PNG error that stopped the write.
-// The benchmark compiles this shared file and calls only the generator.
-#[allow(dead_code)]
-pub fn write_all(directory: &Path) -> Result<(), Box<dyn Error>> {
-    std::fs::create_dir_all(directory)?;
-    for fixture in all() {
-        let path = directory.join(format!("{}.png", fixture.name));
-        let output = BufWriter::new(File::create(path)?);
-        let mut encoder = png::Encoder::new(output, fixture.width, fixture.height);
-        encoder.set_color(png::ColorType::Rgba);
-        encoder.set_depth(png::BitDepth::Eight);
-        let mut writer = encoder.write_header()?;
-        writer.write_image_data(&fixture.rgba)?;
-    }
-    Ok(())
 }
 
 /// One opaque color across the whole image.

@@ -25,11 +25,19 @@ include = [
 [features]
 default = ["std", "cli"]
 std = []
-cli = ["std", "dep:lexopt", "dep:png"]
+cli = [
+    "std",
+    "dep:lexopt",
+    "dep:png",
+    "dep:jpeg-decoder",
+    "dep:image-webp",
+]
 
 [dependencies]
 lexopt = { version = "0.3", optional = true }
 png = { version = "0.18", optional = true }
+jpeg-decoder = { version = "0.3", optional = true, default-features = false, features = ["platform_independent"] }
+image-webp = { version = "0.2.4", optional = true }
 
 [dev-dependencies]
 criterion = "0.7"

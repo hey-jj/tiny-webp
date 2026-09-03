@@ -4,7 +4,8 @@
 mod generator;
 
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, BufWriter};
+use std::path::Path;
 
 #[test]
 fn two_runs_of_the_generator_agree_byte_for_byte_on_every_fixture() {
@@ -89,7 +90,7 @@ fn every_written_png_decodes_to_the_generated_rgba_bytes() {
     if directory.exists() {
         std::fs::remove_dir_all(&directory).expect("remove the old test directory");
     }
-    generator::write_all(&directory).expect("write the fixture files");
+    write_all(&directory);
     let written = std::fs::read_dir(&directory)
         .expect("read the fixture directory")
         .count();
@@ -113,4 +114,20 @@ fn every_written_png_decodes_to_the_generated_rgba_bytes() {
     }
 
     std::fs::remove_dir_all(directory).expect("remove the test directory");
+}
+
+/// Writes the generated pixels as RGBA8 PNG files for this test.
+fn write_all(directory: &Path) {
+    std::fs::create_dir_all(directory).expect("create the fixture directory");
+    for fixture in generator::all() {
+        let path = directory.join(format!("{}.png", fixture.name));
+        let output = BufWriter::new(File::create(path).expect("create the fixture file"));
+        let mut encoder = png::Encoder::new(output, fixture.width, fixture.height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().expect("write the PNG header");
+        writer
+            .write_image_data(&fixture.rgba)
+            .expect("write the PNG pixels");
+    }
 }
