@@ -7,7 +7,7 @@ use crate::prediction::{predict_chroma_dc, predict_luma_dc};
 use crate::quantize::{dequantize_block, factors, quantize_block, QuantizationFactors};
 use crate::residual::{MacroblockResidual, ResidualWriter, COEFF_UPDATE_PROBS};
 use crate::transform::{clamped_add, forward_dct, forward_wht, inverse_dct, inverse_wht};
-use crate::Filter;
+use crate::{Alpha, Filter, Options};
 
 const DC_MODE: u8 = 0;
 
@@ -31,7 +31,7 @@ pub(crate) fn encode(
     height: usize,
     bytes_per_pixel: usize,
     quantizer_index: u8,
-    filter: Filter,
+    options: &Options,
 ) -> EncodedFrame {
     let source = convert(pixels, width, height, bytes_per_pixel);
     let macroblock_columns = width.div_ceil(16);
@@ -49,7 +49,7 @@ pub(crate) fn encode(
     let mut residual_writer = ResidualWriter::new(macroblock_columns);
     let quantization = factors(quantizer_index);
 
-    write_frame_header(&mut first_partition, quantizer_index, filter);
+    write_frame_header(&mut first_partition, quantizer_index, options.filter);
     for macroblock_y in 0..macroblock_rows {
         for macroblock_x in 0..macroblock_columns {
             first_partition.write_tree(&KF_Y_MODE_TREE, &KF_Y_MODE_PROBS, DC_MODE);
@@ -109,7 +109,7 @@ pub(crate) fn encode(
     let second_partition = second_partition.finish();
     let vp8 = assemble_vp8(width, height, &first_partition, &second_partition);
     EncodedFrame {
-        webp: assemble_riff(&vp8),
+        webp: assemble_riff(&vp8, pixels, width, height, bytes_per_pixel, options),
         #[cfg(test)]
         reconstruction,
     }
@@ -318,18 +318,58 @@ fn assemble_vp8(
     vp8
 }
 
-fn assemble_riff(vp8: &[u8]) -> Vec<u8> {
-    let padding = vp8.len() & 1;
-    let mut output = Vec::with_capacity(20 + vp8.len() + padding);
+fn assemble_riff(
+    vp8: &[u8],
+    pixels: &[u8],
+    width: usize,
+    height: usize,
+    bytes_per_pixel: usize,
+    options: &Options,
+) -> Vec<u8> {
+    let has_alpha = bytes_per_pixel == 4
+        && options.alpha == Alpha::Lossless
+        && pixels[3..].iter().step_by(4).any(|value| *value != 255);
+    let extended = has_alpha || options.force_vp8x;
+    let vp8_padding = vp8.len() & 1;
+    let alpha_size = usize::from(has_alpha) * (1 + width * height);
+    let alpha_padding = alpha_size & 1;
+    let extended_size = usize::from(extended) * 18;
+    let alpha_chunk_size = usize::from(has_alpha) * (8 + alpha_size + alpha_padding);
+    let mut output =
+        Vec::with_capacity(20 + vp8.len() + vp8_padding + extended_size + alpha_chunk_size);
     output.extend_from_slice(b"RIFF");
-    output.extend_from_slice(&((12 + vp8.len() + padding) as u32).to_le_bytes());
+    output.extend_from_slice(&[0; 4]);
     output.extend_from_slice(b"WEBP");
+
+    if extended {
+        output.extend_from_slice(b"VP8X");
+        output.extend_from_slice(&10u32.to_le_bytes());
+        output.push(if has_alpha { 0x10 } else { 0x00 });
+        output.extend_from_slice(&[0; 3]);
+        output.extend_from_slice(&(width as u32 - 1).to_le_bytes()[..3]);
+        output.extend_from_slice(&(height as u32 - 1).to_le_bytes()[..3]);
+    }
+
+    if has_alpha {
+        output.extend_from_slice(b"ALPH");
+        output.extend_from_slice(&(alpha_size as u32).to_le_bytes());
+        // The WebP Container Specification's Alpha section assigns zero to
+        // method 0 compression, filtering, preprocessing, and reserved bits.
+        output.push(0);
+        output.extend(pixels[3..].iter().step_by(4).copied());
+        if alpha_padding != 0 {
+            output.push(0);
+        }
+    }
+
     output.extend_from_slice(b"VP8 ");
     output.extend_from_slice(&(vp8.len() as u32).to_le_bytes());
     output.extend_from_slice(vp8);
-    if padding != 0 {
+    if vp8_padding != 0 {
         output.push(0);
     }
+    let riff_size = (output.len() - 8) as u32;
+    output[4..8].copy_from_slice(&riff_size.to_le_bytes());
     output
 }
 
@@ -343,7 +383,7 @@ mod tests {
     use crate::generator;
     use crate::quantize::{factors, quantize_block, quantizer_index, Q_TO_INDEX};
     use crate::transform::{forward_dct, forward_wht};
-    use crate::{Filter, Options};
+    use crate::{Alpha, Filter, Options};
     use std::format;
     use std::fs;
     use std::io::Cursor;
@@ -409,7 +449,12 @@ mod tests {
         let pixels = [
             0, 32, 64, 96, 128, 160, 192, 224, 255, 17, 34, 51, 68, 85, 102, 119, 136, 153,
         ];
-        let encoded = encode(&pixels, 3, 2, 3, 38, Filter::Off).webp;
+        let options = Options {
+            alpha: Alpha::Discard,
+            filter: Filter::Off,
+            ..Options::default()
+        };
+        let encoded = encode(&pixels, 3, 2, 3, 38, &options).webp;
         let riff_size = u32::from_le_bytes(encoded[4..8].try_into().expect("RIFF size bytes"));
         let chunk_size =
             u32::from_le_bytes(encoded[16..20].try_into().expect("chunk size bytes")) as usize;
@@ -457,18 +502,14 @@ mod tests {
     #[test]
     fn filter_values_saturate_and_auto_matches_off_at_version_zero_point_one() {
         let pixels = [128u8; 3];
-        let saturated = encode(
-            &pixels,
-            1,
-            1,
-            3,
-            26,
-            Filter::Level {
+        let saturated_options = Options {
+            filter: Filter::Level {
                 level: 255,
                 sharpness: 255,
             },
-        )
-        .webp;
+            ..Options::default()
+        };
+        let saturated = encode(&pixels, 1, 1, 3, 26, &saturated_options).webp;
         let mut header = crate::bool_coder::BoolDecoder::new(&saturated[30..]);
         assert_eq!(header.read_literal(1), 0);
         assert_eq!(header.read_literal(1), 0);
@@ -477,9 +518,55 @@ mod tests {
         assert_eq!(header.read_literal(6), 63);
         assert_eq!(header.read_literal(3), 7);
 
-        let auto = encode(&pixels, 1, 1, 3, 26, Filter::Auto).webp;
-        let off = encode(&pixels, 1, 1, 3, 26, Filter::Off).webp;
+        let auto = encode(&pixels, 1, 1, 3, 26, &Options::default()).webp;
+        let off_options = Options {
+            filter: Filter::Off,
+            ..Options::default()
+        };
+        let off = encode(&pixels, 1, 1, 3, 26, &off_options).webp;
         assert_eq!(auto, off);
+    }
+
+    #[test]
+    fn a_nonopaque_image_carries_vp8x_alph_and_vp8_chunks_in_order() {
+        let pixels = [10, 20, 30, 7, 40, 50, 60, 255];
+        let encoded = encode(&pixels, 2, 1, 4, 26, &Options::default()).webp;
+
+        assert_eq!(&encoded[..4], b"RIFF");
+        assert_eq!(
+            u32::from_le_bytes(encoded[4..8].try_into().expect("RIFF size bytes")) as usize,
+            encoded.len() - 8
+        );
+        assert_eq!(&encoded[8..12], b"WEBP");
+        assert_eq!(&encoded[12..16], b"VP8X");
+        assert_eq!(&encoded[16..20], &10u32.to_le_bytes());
+        assert_eq!(&encoded[20..30], &[0x10, 0, 0, 0, 1, 0, 0, 0, 0, 0]);
+        assert_eq!(&encoded[30..34], b"ALPH");
+        assert_eq!(&encoded[34..38], &3u32.to_le_bytes());
+        assert_eq!(&encoded[38..41], &[0, 7, 255]);
+        assert_eq!(encoded[41], 0);
+        assert_eq!(&encoded[42..46], b"VP8 ");
+    }
+
+    #[test]
+    fn forcing_vp8x_on_opaque_inputs_sets_no_alpha_flag_or_chunk() {
+        let rgba = [10, 20, 30, 255];
+        let rgb = [10, 20, 30];
+        let options = Options {
+            force_vp8x: true,
+            filter: Filter::Off,
+            ..Options::default()
+        };
+        let from_rgba =
+            crate::encode_rgba(&rgba, 1, 1, &options).expect("encode the forced RGBA container");
+        let from_rgb =
+            crate::encode_rgb(&rgb, 1, 1, &options).expect("encode the forced RGB container");
+
+        assert_eq!(from_rgba, from_rgb);
+        assert_eq!(&from_rgba[12..16], b"VP8X");
+        assert_eq!(&from_rgba[16..20], &10u32.to_le_bytes());
+        assert_eq!(&from_rgba[20..30], &[0; 10]);
+        assert_eq!(&from_rgba[30..34], b"VP8 ");
     }
 
     #[test]
@@ -529,8 +616,10 @@ mod tests {
     }
 
     #[test]
-    fn every_fixture_decodes_at_its_dimensions_with_no_alpha_at_each_quality() {
+    fn every_fixture_decodes_at_its_dimensions_with_exact_alpha_at_each_quality() {
         for fixture in generator::all() {
+            let expected_alpha = alpha_bytes(&fixture.rgba);
+            let has_alpha = expected_alpha.iter().any(|value| *value != 255);
             for quality in [0u8, 25, 50, 75, 90, 95, 100] {
                 let options = Options {
                     quality,
@@ -542,11 +631,124 @@ mod tests {
                 let mut decoder = image_webp::WebPDecoder::new(Cursor::new(encoded))
                     .expect("decode the WebP header");
                 assert_eq!(decoder.dimensions(), (fixture.width, fixture.height));
-                assert_eq!(u8::from(decoder.has_alpha()), 0);
-                let mut pixels = vec![0; fixture.width as usize * fixture.height as usize * 3];
+                assert_eq!(decoder.has_alpha(), has_alpha);
+                let channels = if has_alpha { 4 } else { 3 };
+                let mut pixels =
+                    vec![0; fixture.width as usize * fixture.height as usize * channels];
                 assert_eq!(u8::from(decoder.read_image(&mut pixels).is_ok()), 1);
+                if has_alpha {
+                    assert_eq!(
+                        alpha_bytes(&pixels),
+                        expected_alpha,
+                        "{} q{quality}",
+                        fixture.name
+                    );
+                }
             }
         }
+    }
+
+    #[test]
+    fn opaque_rgba_and_rgb_inputs_use_a_bare_vp8_chunk_at_each_quality() {
+        let fixtures = generator::all();
+        for fixture in &fixtures {
+            let rgb = rgb_bytes(&fixture.rgba);
+            for quality in [0u8, 25, 50, 75, 90, 95, 100] {
+                let options = Options {
+                    quality,
+                    ..Options::default()
+                };
+                let from_rgb = crate::encode_rgb(&rgb, fixture.width, fixture.height, &options)
+                    .expect("encode the RGB fixture");
+                assert_eq!(&from_rgb[12..16], b"VP8 ", "{} q{quality}", fixture.name);
+            }
+        }
+
+        let opaque = fixtures
+            .iter()
+            .find(|fixture| fixture.name == "flat")
+            .expect("find the opaque fixture");
+        for quality in [0u8, 25, 50, 75, 90, 95, 100] {
+            let options = Options {
+                quality,
+                ..Options::default()
+            };
+            let encoded = crate::encode_rgba(&opaque.rgba, opaque.width, opaque.height, &options)
+                .expect("encode the opaque RGBA fixture");
+            assert_eq!(&encoded[12..16], b"VP8 ", "{} q{quality}", opaque.name);
+        }
+    }
+
+    #[test]
+    fn discarded_alpha_matches_rgb_input_bytes_at_each_quality() {
+        for fixture in generator::all()
+            .into_iter()
+            .filter(|fixture| has_nonopaque_alpha(&fixture.rgba))
+        {
+            let rgb = rgb_bytes(&fixture.rgba);
+            for quality in [0u8, 25, 50, 75, 90, 95, 100] {
+                let mut options = Options {
+                    quality,
+                    ..Options::default()
+                };
+                options.alpha = Alpha::Discard;
+                let from_rgba =
+                    crate::encode_rgba(&fixture.rgba, fixture.width, fixture.height, &options)
+                        .expect("encode the RGBA fixture");
+                let from_rgb = crate::encode_rgb(&rgb, fixture.width, fixture.height, &options)
+                    .expect("encode the RGB fixture");
+                assert_eq!(from_rgba, from_rgb, "{} q{quality}", fixture.name);
+                assert_eq!(&from_rgba[12..16], b"VP8 ", "{} q{quality}", fixture.name);
+            }
+        }
+    }
+
+    #[test]
+    fn dwebp_yuv_output_ends_with_each_input_alpha_plane_at_each_quality() {
+        if !oracle_is_available("dwebp") {
+            return;
+        }
+        let directory = scratch_directory("dwebp_preserves_alpha");
+        let input = directory.join("input.webp");
+        let output = directory.join("output.yuv");
+        for fixture in generator::all()
+            .into_iter()
+            .filter(|fixture| has_nonopaque_alpha(&fixture.rgba))
+        {
+            let expected_alpha = alpha_bytes(&fixture.rgba);
+            for quality in [0u8, 25, 50, 75, 90, 95, 100] {
+                let options = Options {
+                    quality,
+                    ..Options::default()
+                };
+                let encoded =
+                    crate::encode_rgba(&fixture.rgba, fixture.width, fixture.height, &options)
+                        .expect("encode the alpha fixture");
+                fs::write(&input, encoded).expect("write the WebP file");
+                let status = Command::new("dwebp")
+                    .arg("-quiet")
+                    .arg("-yuv")
+                    .arg(&input)
+                    .arg("-o")
+                    .arg(&output)
+                    .status()
+                    .expect("run dwebp");
+                assert_eq!(u8::from(status.success()), 1, "{} q{quality}", fixture.name);
+                let decoded = fs::read(&output).expect("read the decoded YUV planes");
+                let chroma_pixels =
+                    fixture.width.div_ceil(2) as usize * fixture.height.div_ceil(2) as usize;
+                let alpha_start =
+                    fixture.width as usize * fixture.height as usize + 2 * chroma_pixels;
+                assert_eq!(decoded.len(), alpha_start + expected_alpha.len());
+                assert_eq!(
+                    &decoded[alpha_start..],
+                    expected_alpha,
+                    "{} q{quality}",
+                    fixture.name
+                );
+            }
+        }
+        fs::remove_dir_all(directory).expect("remove the test directory");
     }
 
     #[test]
@@ -640,6 +842,20 @@ mod tests {
         fs::remove_dir_all(directory).expect("remove the test directory");
     }
 
+    fn alpha_bytes(rgba: &[u8]) -> Vec<u8> {
+        rgba[3..].iter().step_by(4).copied().collect()
+    }
+
+    fn rgb_bytes(rgba: &[u8]) -> Vec<u8> {
+        rgba.chunks_exact(4)
+            .flat_map(|pixel| pixel[..3].iter().copied())
+            .collect()
+    }
+
+    fn has_nonopaque_alpha(rgba: &[u8]) -> bool {
+        rgba[3..].iter().step_by(4).any(|value| *value != 255)
+    }
+
     fn oracle_is_available(command: &str) -> bool {
         let available = Command::new(command)
             .arg("-version")
@@ -676,13 +892,17 @@ mod tests {
         index: u8,
         case: &str,
     ) {
+        let options = Options {
+            filter: Filter::Off,
+            ..Options::default()
+        };
         let encoded = encode(
             &fixture.rgba,
             fixture.width as usize,
             fixture.height as usize,
             4,
             index,
-            Filter::Off,
+            &options,
         );
         let input = directory.join("input.webp");
         let output = directory.join("output.yuv");
@@ -711,6 +931,9 @@ mod tests {
                 let start = row * encoded.reconstruction.chroma_stride;
                 expected.extend_from_slice(&plane[start..start + chroma_width]);
             }
+        }
+        if has_nonopaque_alpha(&fixture.rgba) {
+            expected.extend(alpha_bytes(&fixture.rgba));
         }
         assert_eq!(decoded, expected, "{case}");
     }

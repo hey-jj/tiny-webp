@@ -4,8 +4,8 @@
 //! reads and writes byte slices in memory, so the caller owns every path and
 //! file handle. The library is `no_std` and allocates through `alloc`.
 //!
-//! Version 0.1.0 writes an opaque, lossy WebP stream with DC prediction and a
-//! fixed quantizer chosen from [`Options::quality`].
+//! Version 0.1.0 writes a lossy WebP stream with DC prediction, exact alpha,
+//! and a fixed quantizer chosen from [`Options::quality`].
 //!
 //! [`Options`] is `#[non_exhaustive]`, so build one from its default and
 //! assign the fields that change.
@@ -172,7 +172,7 @@ pub fn encode_rgba(rgba: &[u8], width: u32, height: u32, opts: &Options) -> Resu
         height as usize,
         4,
         quantize::quantizer_index(opts.quality),
-        opts.filter,
+        opts,
     )
     .webp)
 }
@@ -195,7 +195,7 @@ pub fn encode_rgb(rgb: &[u8], width: u32, height: u32, opts: &Options) -> Result
         height as usize,
         3,
         quantize::quantizer_index(opts.quality),
-        opts.filter,
+        opts,
     )
     .webp)
 }
