@@ -1,66 +1,12 @@
 //! What the two entry points return for well-formed and malformed calls.
 
-use tiny_webp::{encode_rgb, encode_rgba, Error, Options, MAX_DIMENSION};
+use tiny_webp::{encode_rgb, encode_rgba, Error, Options};
 
 /// Builds options at a quality the way a caller outside the crate builds them.
 fn at_quality(quality: u8) -> Options {
     let mut opts = Options::default();
     opts.quality = quality;
     opts
-}
-
-#[test]
-fn every_size_from_one_to_forty_eight_writes_a_riff_file_at_three_qualities() {
-    for quality in [0u8, 50, 100] {
-        let opts = at_quality(quality);
-        for width in 1..=48u32 {
-            for height in 1..=48u32 {
-                let pixels = width as usize * height as usize;
-                let rgba = encode_rgba(&vec![0u8; pixels * 4], width, height, &opts)
-                    .map(|bytes| bytes[..4].to_vec());
-                let rgb = encode_rgb(&vec![0u8; pixels * 3], width, height, &opts)
-                    .map(|bytes| bytes[..4].to_vec());
-                assert_eq!(
-                    rgba,
-                    Ok(b"RIFF".to_vec()),
-                    "RGBA {width}x{height} q{quality}"
-                );
-                assert_eq!(rgb, Ok(b"RIFF".to_vec()), "RGB {width}x{height} q{quality}");
-            }
-        }
-    }
-}
-
-#[test]
-fn a_zero_or_oversized_side_comes_back_carrying_the_values_that_were_passed() {
-    let opts = Options::default();
-    for (width, height) in [
-        (0u32, 8u32),
-        (8, 0),
-        (0, 0),
-        (16384, 8),
-        (8, 16384),
-        (16384, 16384),
-    ] {
-        assert_eq!(
-            encode_rgba(&[], width, height, &opts),
-            Err(Error::DimensionsOutOfRange { width, height })
-        );
-        assert_eq!(
-            encode_rgb(&[], width, height, &opts),
-            Err(Error::DimensionsOutOfRange { width, height })
-        );
-    }
-}
-
-#[test]
-fn the_longest_side_the_bitstream_carries_writes_a_riff_file_on_either_axis() {
-    let opts = Options::default();
-    let strip = vec![0u8; MAX_DIMENSION as usize * 4];
-    let horizontal = encode_rgba(&strip, MAX_DIMENSION, 1, &opts).map(|bytes| bytes[..4].to_vec());
-    let vertical = encode_rgba(&strip, 1, MAX_DIMENSION, &opts).map(|bytes| bytes[..4].to_vec());
-    assert_eq!(horizontal, Ok(b"RIFF".to_vec()));
-    assert_eq!(vertical, Ok(b"RIFF".to_vec()));
 }
 
 #[test]

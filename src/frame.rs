@@ -808,6 +808,53 @@ mod tests {
     }
 
     #[test]
+    fn every_swept_dimension_decodes_and_matches_reconstruction_and_boundary_sides_return_errors() {
+        let oracle_available = oracle_is_available("dwebp");
+        let directory = scratch_directory(
+            "every_swept_dimension_decodes_and_matches_reconstruction_and_boundary_sides_return_errors",
+        );
+        for quality in [0u8, 50, 100] {
+            for width in 1..=48u32 {
+                for height in 1..=48u32 {
+                    let fixture = generator::noise("dimension-sweep", width, height);
+                    assert_dimension_case(&directory, &fixture, quality, oracle_available);
+                }
+            }
+        }
+        for (width, height) in [
+            (16383, 1),
+            (1, 16383),
+            (16383, 3),
+            (3, 16383),
+            (4097, 1),
+            (1, 4097),
+        ] {
+            let fixture = generator::noise("long-dimension-sweep", width, height);
+            assert_dimension_case(&directory, &fixture, 50, oracle_available);
+        }
+
+        let options = Options::default();
+        for (width, height) in [
+            (0u32, 8u32),
+            (8, 0),
+            (0, 0),
+            (16384, 8),
+            (8, 16384),
+            (16384, 16384),
+        ] {
+            assert_eq!(
+                crate::encode_rgba(&[], width, height, &options),
+                Err(crate::Error::DimensionsOutOfRange { width, height })
+            );
+            assert_eq!(
+                crate::encode_rgb(&[], width, height, &options),
+                Err(crate::Error::DimensionsOutOfRange { width, height })
+            );
+        }
+        fs::remove_dir_all(directory).expect("remove the test directory");
+    }
+
+    #[test]
     fn a_reconstruction_difference_names_its_fixture_index_plane_row_and_column() {
         assert_eq!(
             reconstruction_difference_message("flat", 26, "U", 3, 7),
@@ -862,6 +909,102 @@ mod tests {
 
     fn has_nonopaque_alpha(rgba: &[u8]) -> bool {
         rgba[3..].iter().step_by(4).any(|value| *value != 255)
+    }
+
+    fn assert_dimension_case(
+        directory: &Path,
+        fixture: &generator::Fixture,
+        quality: u8,
+        oracle_available: bool,
+    ) {
+        let options = Options {
+            quality,
+            ..Options::default()
+        };
+        let rgb = rgb_bytes(&fixture.rgba);
+        let rgba_webp = crate::encode_rgba(&fixture.rgba, fixture.width, fixture.height, &options)
+            .expect("encode the RGBA dimension case");
+        let rgb_webp = crate::encode_rgb(&rgb, fixture.width, fixture.height, &options)
+            .expect("encode the RGB dimension case");
+        assert_image_webp_decodes(&rgba_webp, fixture, quality, "RGBA");
+        assert_image_webp_decodes(&rgb_webp, fixture, quality, "RGB");
+
+        if oracle_available {
+            assert_reconstruction_for_pixels(
+                directory,
+                fixture,
+                quality,
+                &fixture.rgba,
+                4,
+                &rgba_webp,
+                "RGBA",
+            );
+            assert_reconstruction_for_pixels(
+                directory, fixture, quality, &rgb, 3, &rgb_webp, "RGB",
+            );
+        }
+    }
+
+    fn assert_image_webp_decodes(
+        webp: &[u8],
+        fixture: &generator::Fixture,
+        quality: u8,
+        entry: &str,
+    ) {
+        let mut decoder = image_webp::WebPDecoder::new(Cursor::new(webp))
+            .expect("decode the dimension case header");
+        assert_eq!(
+            decoder.dimensions(),
+            (fixture.width, fixture.height),
+            "{entry} {}x{} q{quality}",
+            fixture.width,
+            fixture.height
+        );
+        assert_eq!(
+            u8::from(decoder.has_alpha()),
+            0,
+            "{entry} {}x{} q{quality}",
+            fixture.width,
+            fixture.height
+        );
+        let mut pixels = vec![0; fixture.width as usize * fixture.height as usize * 3];
+        assert_eq!(
+            u8::from(decoder.read_image(&mut pixels).is_ok()),
+            1,
+            "{entry} {}x{} q{quality}",
+            fixture.width,
+            fixture.height
+        );
+    }
+
+    fn assert_reconstruction_for_pixels(
+        directory: &Path,
+        fixture: &generator::Fixture,
+        quality: u8,
+        pixels: &[u8],
+        bytes_per_pixel: usize,
+        expected_webp: &[u8],
+        entry: &str,
+    ) {
+        let options = Options {
+            filter: Filter::Off,
+            ..Options::default()
+        };
+        let index = quantizer_index(quality);
+        let encoded = encode(
+            pixels,
+            fixture.width as usize,
+            fixture.height as usize,
+            bytes_per_pixel,
+            index,
+            &options,
+        );
+        assert_eq!(
+            encoded.webp, expected_webp,
+            "{entry} {}x{} q{quality}",
+            fixture.width, fixture.height
+        );
+        assert_encoded_reconstruction(directory, fixture, index, &encoded);
     }
 
     fn oracle_is_available(command: &str) -> bool {
@@ -920,6 +1063,15 @@ mod tests {
             index,
             &options,
         );
+        assert_encoded_reconstruction(directory, fixture, index, &encoded);
+    }
+
+    fn assert_encoded_reconstruction(
+        directory: &Path,
+        fixture: &generator::Fixture,
+        index: u8,
+        encoded: &super::EncodedFrame,
+    ) {
         let input = directory.join("input.webp");
         let output = directory.join("output.yuv");
         fs::write(&input, &encoded.webp).expect("write the WebP file");

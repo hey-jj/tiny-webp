@@ -116,7 +116,7 @@ fn text_blocks(name: &'static str, width: u32, height: u32) -> Fixture {
 }
 
 /// An independent value in every color byte.
-fn noise(name: &'static str, width: u32, height: u32) -> Fixture {
+pub(crate) fn noise(name: &'static str, width: u32, height: u32) -> Fixture {
     let mut rng = Rng::seeded(name);
     let mut rgba = Vec::with_capacity(pixel_bytes(width, height));
     for _ in 0..width * height {
