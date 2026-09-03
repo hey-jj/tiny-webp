@@ -3,6 +3,29 @@
 All notable changes to this project are documented here. The format follows
 Keep a Changelog, and the project uses semantic versioning.
 
+## [0.1.0] - 2026-09-03
+
+### Added
+
+- A lossy WebP encoder for RGB and RGBA buffers. It uses DC prediction, the Y2
+  transform path, one token partition, and the quantizer selected by
+  `Options::quality`.
+- RIFF WebP output with a bare `VP8 ` chunk for opaque images. Transparent
+  input or `Options::force_vp8x` adds the extended container header.
+- Exact alpha storage in an uncompressed `ALPH` chunk. `Alpha::Discard` drops
+  the input alpha plane.
+- The `tiny-webp` command reads PNG, JPEG, and WebP from files or stdin. It
+  writes WebP to files or stdout.
+- A SHA-256 digest manifest that pins the encoded bytes for the fixture set.
+- A fuzz target that exercises dimensions, quality, alpha settings, container
+  shapes, and incomplete pixel buffers.
+- A calibration record with throughput, peak heap use, output size, decoded
+  PSNR, and cwebp comparisons.
+
+### Removed
+
+- `Error::Unimplemented`. Valid buffers now return encoded WebP bytes.
+
 ## [0.0.0] - 2026-09-03
 
 The charter tree. Nothing at this version is published. A library call that

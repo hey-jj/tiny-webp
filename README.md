@@ -9,11 +9,17 @@ file handles stay with the caller.
 
 ## Status
 
-Version 0.0.0 is the charter tree. It carries the public surface, the checks
-that guard it, the fixture generator, the benchmark harness, and a CI workflow
-that runs on Linux and macOS. Every library call that clears the dimension and
-buffer checks returns `Error::Unimplemented`. The binary reads a command line
-and prints its usage. Encoding arrives in 0.1.0.
+Version 0.1.0 writes one lossy VP8 key frame in a RIFF WebP container. Opaque
+images use a bare `VP8 ` chunk. Images with transparency use `VP8X`, an
+uncompressed `ALPH` chunk, and `VP8 `. The alpha bytes stay exact.
+
+The encoder uses DC prediction for luma and chroma, the Y2 transform path, one
+token partition, and a fixed quantizer selected by `q`. At a given `q`, its
+output quality sits below cwebp's until M2 adds mode selection and probability
+updates.
+
+The command reads PNG, JPEG, and WebP from a path or stdin. It writes WebP to a
+path or stdout.
 
 ## Library
 

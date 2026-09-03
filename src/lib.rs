@@ -1,11 +1,12 @@
-//! Lossy WebP encoder for RGB and RGBA pixel buffers.
+//! Encodes RGB and RGBA pixel buffers as lossy WebP files.
 //!
-//! The crate writes a single VP8 key frame inside a RIFF WebP container. It
-//! reads and writes byte slices in memory, so the caller owns every path and
-//! file handle. The library is `no_std` and allocates through `alloc`.
+//! Version 0.1.0 writes one VP8 key frame in a RIFF WebP container. It uses DC
+//! prediction, the Y2 transform path, one token partition, and a fixed
+//! quantizer chosen from [`Options::quality`]. The encoder keeps exact alpha
+//! from non-opaque RGBA input in an uncompressed `ALPH` chunk.
 //!
-//! Version 0.1.0 writes a lossy WebP stream with DC prediction, exact alpha,
-//! and a fixed quantizer chosen from [`Options::quality`].
+//! The library is `no_std` and allocates through `alloc`. It reads and writes
+//! byte slices in memory. Callers own file and stream I/O.
 //!
 //! [`Options`] is `#[non_exhaustive]`, so build one from its default and
 //! assign the fields that change.
