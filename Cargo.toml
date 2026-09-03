@@ -49,6 +49,10 @@ name = "tiny-webp"
 path = "src/bin/tiny-webp.rs"
 required-features = ["cli"]
 
+[[example]]
+name = "bench"
+required-features = ["cli"]
+
 [[bench]]
 name = "encode"
 harness = false

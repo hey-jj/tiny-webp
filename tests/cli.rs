@@ -2,6 +2,8 @@
 
 #[path = "../fixtures/generator.rs"]
 mod generator;
+#[path = "../fixtures/png_writer.rs"]
+mod png_writer;
 
 use std::ffi::OsStr;
 use std::io::{Cursor, Write};
@@ -87,29 +89,20 @@ fn scratch_directory(test_name: &str) -> PathBuf {
 
 fn png_bytes(fixture: &generator::Fixture) -> Vec<u8> {
     let mut bytes = Vec::new();
-    {
-        let mut encoder = png::Encoder::new(&mut bytes, fixture.width, fixture.height);
-        encoder.set_color(png::ColorType::Rgba);
-        encoder.set_depth(png::BitDepth::Eight);
-        let mut writer = encoder.write_header().expect("write the PNG header");
-        writer
-            .write_image_data(&fixture.rgba)
-            .expect("write the PNG pixels");
-    }
+    png_writer::write(
+        &mut bytes,
+        fixture.width,
+        fixture.height,
+        png::ColorType::Rgba,
+        &fixture.rgba,
+    )
+    .expect("write the PNG pixels");
     bytes
 }
 
 fn png_with_color(width: u32, height: u32, color: png::ColorType, pixels: &[u8]) -> Vec<u8> {
     let mut bytes = Vec::new();
-    {
-        let mut encoder = png::Encoder::new(&mut bytes, width, height);
-        encoder.set_color(color);
-        encoder.set_depth(png::BitDepth::Eight);
-        let mut writer = encoder.write_header().expect("write the PNG header");
-        writer
-            .write_image_data(pixels)
-            .expect("write the PNG pixels");
-    }
+    png_writer::write(&mut bytes, width, height, color, pixels).expect("write the PNG pixels");
     bytes
 }
 

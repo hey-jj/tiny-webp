@@ -36,6 +36,9 @@ mod frame;
 #[cfg(test)]
 #[path = "../fixtures/generator.rs"]
 mod generator;
+#[cfg(test)]
+#[path = "../fixtures/png_writer.rs"]
+mod png_writer;
 pub(crate) mod prediction;
 mod quantize;
 mod residual;

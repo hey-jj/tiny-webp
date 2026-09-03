@@ -1,4 +1,4 @@
-//! Times one encode call at the default quality.
+//! Times `photo-large` at quality 75.
 
 #[path = "../fixtures/generator.rs"]
 mod generator;
@@ -11,11 +11,12 @@ use tiny_webp::Options;
 fn encode_one_fixture(c: &mut Criterion) {
     let fixture = generator::all()
         .into_iter()
-        .find(|candidate| candidate.name == "gradient")
-        .expect("the gradient fixture is in the table");
-    let opts = Options::default();
+        .find(|candidate| candidate.name == "photo-large")
+        .expect("the photo-large fixture is in the table");
+    let mut opts = Options::default();
+    opts.quality = 75;
 
-    c.bench_function(fixture.name, |b| {
+    c.bench_function("photo-large q75", |b| {
         b.iter(|| {
             tiny_webp::encode_rgba(
                 black_box(&fixture.rgba),

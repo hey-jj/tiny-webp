@@ -1041,13 +1041,14 @@ mod tests {
 
     fn write_png(path: &Path, fixture: &generator::Fixture) {
         let output = std::io::BufWriter::new(fs::File::create(path).expect("create the PNG file"));
-        let mut encoder = png::Encoder::new(output, fixture.width, fixture.height);
-        encoder.set_color(png::ColorType::Rgba);
-        encoder.set_depth(png::BitDepth::Eight);
-        let mut writer = encoder.write_header().expect("write the PNG header");
-        writer
-            .write_image_data(&fixture.rgba)
-            .expect("write the PNG pixels");
+        crate::png_writer::write(
+            output,
+            fixture.width,
+            fixture.height,
+            png::ColorType::Rgba,
+            &fixture.rgba,
+        )
+        .expect("write the PNG pixels");
     }
 
     fn assert_reconstruction(directory: &Path, fixture: &generator::Fixture, index: u8) {

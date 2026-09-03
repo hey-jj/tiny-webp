@@ -2,6 +2,8 @@
 
 #[path = "../fixtures/generator.rs"]
 mod generator;
+#[path = "../fixtures/png_writer.rs"]
+mod png_writer;
 
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
@@ -122,12 +124,13 @@ fn write_all(directory: &Path) {
     for fixture in generator::all() {
         let path = directory.join(format!("{}.png", fixture.name));
         let output = BufWriter::new(File::create(path).expect("create the fixture file"));
-        let mut encoder = png::Encoder::new(output, fixture.width, fixture.height);
-        encoder.set_color(png::ColorType::Rgba);
-        encoder.set_depth(png::BitDepth::Eight);
-        let mut writer = encoder.write_header().expect("write the PNG header");
-        writer
-            .write_image_data(&fixture.rgba)
-            .expect("write the PNG pixels");
+        png_writer::write(
+            output,
+            fixture.width,
+            fixture.height,
+            png::ColorType::Rgba,
+            &fixture.rgba,
+        )
+        .expect("write the PNG pixels");
     }
 }
