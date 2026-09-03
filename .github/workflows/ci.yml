@@ -66,6 +66,13 @@ jobs:
             exit 1
           fi
 
+      - name: the graph carries no C
+        run: |
+          if cargo tree -e all --all-features | grep -E '\bcc v|-sys v|alloca'; then
+            echo "a crate that compiles C or links a system library reached the graph"
+            exit 1
+          fi
+
   msrv:
     name: msrv (1.85.0)
     runs-on: ubuntu-latest

@@ -31,7 +31,7 @@ cli = ["std", "dep:lexopt"]
 lexopt = { version = "0.3", optional = true }
 
 [dev-dependencies]
-criterion = "0.8"
+criterion = "0.7"
 
 [[bin]]
 name = "tiny-webp"
