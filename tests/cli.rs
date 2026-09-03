@@ -178,6 +178,10 @@ fn help_and_version_stop_parsing_when_the_parser_reaches_them() {
 #[test]
 fn every_usage_error_prints_its_exact_problem_and_the_usage_text() {
     assert_usage_error(
+        &["--noalpha=value"],
+        "Unknown command line option. Expected a supported option.",
+    );
+    assert_usage_error(
         &["--sharp-yuv", "in.png", "-o", "out.webp"],
         "Unknown flag --sharp-yuv. Expected a supported option.",
     );
@@ -530,6 +534,53 @@ fn stdin_and_stdout_write_the_same_bytes_as_file_paths() {
         std::fs::read(output_path).expect("read the file output")
     );
     std::fs::remove_dir_all(directory).expect("remove the test directory");
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unreadable_stdin_exits_one_with_its_exact_problem_line() {
+    let directory = scratch_directory("stdin_problem");
+    let output_path = directory.join("output.webp");
+    let stdin = std::fs::File::open(&directory).expect("open the test directory");
+    let output = command()
+        .args([OsStr::new("-"), OsStr::new("-o"), output_path.as_os_str()])
+        .stdin(stdin)
+        .output()
+        .expect("run the binary");
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.stdout, b"");
+    assert_eq!(
+        output.stderr,
+        b"tiny-webp: Could not read stdin. Check that standard input is readable.\n"
+    );
+    std::fs::remove_dir_all(directory).expect("remove the test directory");
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unwritable_stdout_exits_one_with_its_exact_problem_line() {
+    let fixture = generator::all().remove(0);
+    let mut child = command()
+        .args(["-quiet", "-", "-o", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start the binary");
+    drop(child.stdout.take().expect("open the output pipe"));
+    child
+        .stdin
+        .take()
+        .expect("open the input pipe")
+        .write_all(&png_bytes(&fixture))
+        .expect("write the input pipe");
+    let output = child.wait_with_output().expect("collect the binary output");
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.stdout, b"");
+    assert_eq!(
+        output.stderr,
+        b"tiny-webp: Could not write stdout. Check that standard output is writable.\n"
+    );
 }
 
 #[test]
