@@ -40,6 +40,8 @@ mod bool_coder;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod prediction;
 mod quantize;
+#[allow(dead_code)]
+mod residual;
 #[cfg_attr(not(test), allow(dead_code))]
 mod transform;
 
