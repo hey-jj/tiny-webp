@@ -21,6 +21,20 @@ updates.
 The command reads PNG, JPEG, and WebP from a path or stdin. It writes WebP to a
 path or stdout.
 
+## Install
+
+Install the command:
+
+```sh
+cargo install tiny-webp
+```
+
+Add the library to `[dependencies]`:
+
+```toml
+tiny-webp = "0.1"
+```
+
 ## Library
 
 `Options` is `#[non_exhaustive]`, so build one from its default and assign the
