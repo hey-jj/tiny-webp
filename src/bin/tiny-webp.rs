@@ -123,7 +123,19 @@ where
     let mut quiet = false;
     let mut verbose = false;
 
-    let args = args.into_iter().map(expand_single_dash);
+    let mut values_only = false;
+    let mut value_next = false;
+    let args = args.into_iter().map(move |arg| {
+        if values_only || value_next {
+            value_next = false;
+            return arg;
+        }
+        let arg = expand_single_dash(arg);
+        let bytes = arg.as_os_str().as_encoded_bytes();
+        values_only = bytes == b"--";
+        value_next = matches!(bytes, b"-q" | b"--quality" | b"-o" | b"--output");
+        arg
+    });
     let mut parser = lexopt::Parser::from_args(args);
     while let Some(arg) = parser.next().map_err(|_| UNKNOWN_OPTION.to_owned())? {
         match arg {

@@ -226,6 +226,67 @@ fn every_usage_error_prints_its_exact_problem_and_the_usage_text() {
 }
 
 #[test]
+fn dash_prefixed_paths_keep_their_bytes_in_value_positions() {
+    let directory = scratch_directory("dash_prefixed_paths_keep_their_bytes_in_value_positions");
+    let pixels = [96, 128, 160];
+    let png = png_with_color(1, 1, png::ColorType::Rgb, &pixels);
+    let expected =
+        tiny_webp::encode_rgb(&pixels, 1, 1, &Options::default()).expect("encode the input pixels");
+    std::fs::write(directory.join("-pixel.png"), &png).expect("write the input path");
+    for flag in ["-o", "--output", "-output"] {
+        let output = command()
+            .current_dir(&directory)
+            .args(["-quiet", flag, "-out.webp", "--", "-pixel.png"])
+            .output()
+            .expect("run the binary");
+        assert_eq!(output.status.code(), Some(0), "{flag}");
+        assert_eq!(output.stdout, b"", "{flag}");
+        assert_eq!(output.stderr, b"", "{flag}");
+        assert_eq!(
+            std::fs::read(directory.join("-out.webp")).expect("read the output path"),
+            expected,
+            "{flag}"
+        );
+        assert_eq!(u8::from(directory.join("--out.webp").exists()), 0);
+        std::fs::remove_file(directory.join("-out.webp")).expect("remove the output path");
+    }
+    assert_usage_error(
+        &["-q", "-100", "input.png", "-o", "out.webp"],
+        "Invalid quality -100. Expected a whole number from 0 to 100.",
+    );
+    std::fs::remove_dir_all(directory).expect("remove the test directory");
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_dash_prefixed_paths_keep_their_bytes_in_value_positions() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let directory =
+        scratch_directory("non_utf8_dash_prefixed_paths_keep_their_bytes_in_value_positions");
+    let input = std::ffi::OsString::from_vec(b"-pixel-\xff.png".to_vec());
+    let output_path = std::ffi::OsString::from_vec(b"-out-\xff.webp".to_vec());
+    let output = command()
+        .current_dir(&directory)
+        .args([
+            OsStr::new("-quiet"),
+            OsStr::new("-o"),
+            &output_path,
+            OsStr::new("--"),
+            &input,
+        ])
+        .output()
+        .expect("run the binary");
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.stdout, b"");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "tiny-webp: Could not read -pixel-�.png. Check that the input path is readable.\n"
+    );
+    std::fs::remove_dir_all(directory).expect("remove the test directory");
+}
+
+#[test]
 fn repeated_flags_take_their_last_value_or_keep_their_first_effect() {
     let directory = scratch_directory("repeated_flags");
     let fixture = generator::all()
