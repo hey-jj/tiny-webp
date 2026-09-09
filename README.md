@@ -21,11 +21,8 @@ Size and RGB PSNR relative to cwebp vary by image and `q`.
 At all three settings, `flat` and `one-pixel` produce smaller files than
 cwebp. Every other fixture produces larger files.
 
-At `q` 75, RGB PSNR exceeds cwebp's for `text-blocks`, `noise`,
-`lowpass-noise`, `alpha-hard`, `alpha-odd`, `photo-large`, and `odd-size`.
-It falls below cwebp's for `flat`, `checker`, `gradient`, `alpha-soft`,
-`single-column`, and `single-row`. Both encoders have zero RGB error on
-`one-pixel`.
+At `q` 75, `photo-large` uses 1.59 times cwebp's bytes. Its RGB PSNR is
+30.5 dB against cwebp's 29.5 dB.
 
 The command reads PNG, JPEG, and WebP from a path or stdin. It writes WebP to a
 path or stdout.
