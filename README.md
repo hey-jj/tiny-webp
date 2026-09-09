@@ -14,9 +14,18 @@ images use a bare `VP8 ` chunk. Images with transparency use `VP8X`, an
 uncompressed `ALPH` chunk, and `VP8 `. The alpha bytes stay exact.
 
 The encoder uses DC prediction for luma and chroma, the Y2 transform path, one
-token partition, and a fixed quantizer selected by `q`. At a given `q`, its
-output quality sits below cwebp's until M2 adds mode selection and probability
-updates.
+token partition, and a fixed quantizer selected by `q`.
+
+Size and RGB PSNR relative to cwebp vary by image and `q`.
+[CALIBRATION.md](CALIBRATION.md) records results at `q` 50, 75, and 90.
+At all three settings, `flat` and `one-pixel` produce smaller files than
+cwebp. Every other fixture produces larger files.
+
+At `q` 75, RGB PSNR exceeds cwebp's for `text-blocks`, `noise`,
+`lowpass-noise`, `alpha-hard`, `alpha-odd`, `photo-large`, and `odd-size`.
+It falls below cwebp's for `flat`, `checker`, `gradient`, `alpha-soft`,
+`single-column`, and `single-row`. Both encoders have zero RGB error on
+`one-pixel`.
 
 The command reads PNG, JPEG, and WebP from a path or stdin. It writes WebP to a
 path or stdout.
