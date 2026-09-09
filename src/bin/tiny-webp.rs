@@ -85,13 +85,9 @@ struct Success {
 
 fn main() -> ExitCode {
     match parse(std::env::args_os().skip(1)) {
-        Ok(Action::Help) => {
-            print!("{USAGE}");
-            ExitCode::SUCCESS
-        }
+        Ok(Action::Help) => print_stdout(USAGE.as_bytes()),
         Ok(Action::Version) => {
-            println!("{VERSION_PREFIX}{}", env!("CARGO_PKG_VERSION"));
-            ExitCode::SUCCESS
+            print_stdout(format!("{VERSION_PREFIX}{}\n", env!("CARGO_PKG_VERSION")).as_bytes())
         }
         Ok(Action::Encode(cli)) => match encode(cli) {
             Ok(success) => {
@@ -109,6 +105,16 @@ fn main() -> ExitCode {
             eprintln!("{PROGRAM_PREFIX}{problem}");
             eprint!("{USAGE}");
             ExitCode::from(2)
+        }
+    }
+}
+
+fn print_stdout(bytes: &[u8]) -> ExitCode {
+    match write_output(OsStr::new("-"), bytes) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(problem) => {
+            eprintln!("{PROGRAM_PREFIX}{problem}");
+            ExitCode::from(1)
         }
     }
 }

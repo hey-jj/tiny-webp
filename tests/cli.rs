@@ -175,6 +175,27 @@ fn help_and_version_stop_parsing_when_the_parser_reaches_them() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn help_and_version_exit_one_with_one_problem_line_when_the_output_pipe_has_no_reader() {
+    for flag in ["-h", "-version"] {
+        let (reader, writer) = std::io::pipe().expect("create the output pipe");
+        drop(reader);
+        let output = command()
+            .arg(flag)
+            .stdout(Stdio::from(writer))
+            .output()
+            .expect("run the binary with an output pipe");
+        assert_eq!(output.status.code(), Some(1), "{flag}");
+        assert_eq!(output.stdout, b"", "{flag}");
+        assert_eq!(
+            output.stderr,
+            b"tiny-webp: Could not write stdout. Check that standard output is writable.\n",
+            "{flag}"
+        );
+    }
+}
+
 #[test]
 fn every_usage_error_prints_its_exact_problem_and_the_usage_text() {
     assert_usage_error(
