@@ -360,8 +360,20 @@ fn write_output(output: &OsStr, bytes: &[u8]) -> Result<(), String> {
     }
 }
 
+fn display_path(path: &OsStr) -> String {
+    let mut display = String::new();
+    for character in path.to_string_lossy().chars() {
+        if character.is_control() {
+            display.extend(character.escape_default());
+        } else {
+            display.push(character);
+        }
+    }
+    display
+}
+
 fn named_problem(template: &str, name: &OsStr) -> String {
-    template.replace("{name}", &name.to_string_lossy())
+    template.replace("{name}", &display_path(name))
 }
 
 fn summary(success: &Success) -> String {
@@ -376,7 +388,7 @@ fn summary(success: &Success) -> String {
         let output = if success.output == OsStr::new("-") {
             STDOUT_NAME.into()
         } else {
-            success.output.to_string_lossy()
+            display_path(&success.output)
         };
         SUMMARY
             .replace("{bytes}", &success.byte_count.to_string())

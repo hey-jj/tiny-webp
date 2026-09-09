@@ -665,6 +665,87 @@ fn an_unwritable_stdout_exits_one_with_its_exact_problem_line() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn diagnostics_and_summaries_escape_control_characters_in_paths() {
+    let directory =
+        scratch_directory("diagnostics_and_summaries_escape_control_characters_in_paths");
+    let input = "pixel\n\r\t\u{1b}\u{85}.png";
+    let output_path = "out\n\r\t\u{1b}\u{85}.webp";
+    let input_text = r"pixel\n\r\t\u{1b}\u{85}.png";
+    let output_text = r"out\n\r\t\u{1b}\u{85}.webp";
+    let run_in_directory = |args: &[&str]| {
+        command()
+            .current_dir(&directory)
+            .args(args)
+            .output()
+            .expect("run the binary")
+    };
+    let missing = run_in_directory(&[input, "-o", output_path]);
+    assert_eq!(missing.status.code(), Some(1));
+    assert_eq!(missing.stdout, b"");
+    assert_eq!(
+        String::from_utf8_lossy(&missing.stderr),
+        format!("tiny-webp: Could not read {input_text}. Check that the input path is readable.\n")
+    );
+
+    let second = run_in_directory(&["first.png", input, "-o", output_path]);
+    assert_eq!(second.status.code(), Some(2));
+    assert_eq!(second.stdout, b"");
+    assert_eq!(
+        String::from_utf8_lossy(&second.stderr),
+        format!(
+            "tiny-webp: Unexpected input path {input_text}. tiny-webp reads one input path.\n{}",
+            readme_usage()
+        )
+    );
+
+    std::fs::write(directory.join(input), b"text").expect("write the unsupported input");
+    let unsupported = run_in_directory(&[input, "-o", output_path]);
+    assert_eq!(unsupported.status.code(), Some(1));
+    assert_eq!(unsupported.stdout, b"");
+    assert_eq!(
+        String::from_utf8_lossy(&unsupported.stderr),
+        format!("tiny-webp: Could not decode {input_text}. Expected PNG, JPEG, or WebP bytes.\n")
+    );
+
+    let pixels = [96, 128, 160];
+    std::fs::write(
+        directory.join(input),
+        png_with_color(1, 1, png::ColorType::Rgb, &pixels),
+    )
+    .expect("write the PNG input");
+    std::fs::create_dir(directory.join(output_path)).expect("create the unwritable output path");
+    let unwritable = run_in_directory(&[input, "-o", output_path]);
+    assert_eq!(unwritable.status.code(), Some(1));
+    assert_eq!(unwritable.stdout, b"");
+    assert_eq!(
+        String::from_utf8_lossy(&unwritable.stderr),
+        format!(
+            "tiny-webp: Could not write {output_text}. Check that the output path is writable.\n"
+        )
+    );
+    std::fs::remove_dir(directory.join(output_path)).expect("remove the output directory");
+
+    let success = run_in_directory(&[input, "-o", output_path]);
+    let expected =
+        tiny_webp::encode_rgb(&pixels, 1, 1, &Options::default()).expect("encode the input pixels");
+    assert_eq!(success.status.code(), Some(0));
+    assert_eq!(success.stdout, b"");
+    assert_eq!(
+        String::from_utf8_lossy(&success.stderr),
+        format!(
+            "tiny-webp: wrote {} bytes to {output_text}\n",
+            expected.len()
+        )
+    );
+    assert_eq!(
+        std::fs::read(directory.join(output_path)).expect("read the output path"),
+        expected
+    );
+    std::fs::remove_dir_all(directory).expect("remove the test directory");
+}
+
 #[test]
 fn summary_and_verbose_success_lines_match_their_exact_shapes() {
     let directory = scratch_directory("success_lines");
