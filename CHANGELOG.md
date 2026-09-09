@@ -3,6 +3,22 @@
 All notable changes to this project are documented here. The format follows
 Keep a Changelog, and the project uses semantic versioning.
 
+## [0.1.1] - 2026-09-09
+
+### Fixed
+
+- Input paths after `--` and output names with a leading dash now keep the
+  spelling entered on the command line.
+- `-h` and `-version` now exit 1 with one stderr line when stdout cannot
+  accept a write or flush. These failures previously caused a panic.
+- Diagnostics and output summaries now escape control characters in paths
+  so each message stays on one line. File access uses the path as entered.
+
+### Documentation
+
+- The README now states how file size and RGB PSNR compare with cwebp across
+  the recorded fixtures and quality settings.
+
 ## [0.1.0] - 2026-09-03
 
 ### Added
