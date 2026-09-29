@@ -3,7 +3,7 @@ use alloc::vec::Vec;
 
 use crate::bool_coder::BoolEncoder;
 use crate::color::{convert, YuvPlanes};
-use crate::prediction::{predict_chroma_dc, predict_luma_dc};
+use crate::prediction::{predict_chroma, predict_luma};
 use crate::quantize::{dequantize_block, factors, quantize_block, QuantizationFactors};
 use crate::residual::{MacroblockResidual, ResidualWriter, COEFF_UPDATE_PROBS};
 use crate::transform::{clamped_add, forward_dct, forward_wht, inverse_dct, inverse_wht};
@@ -55,19 +55,19 @@ pub(crate) fn encode(
             first_partition.write_tree(&KF_Y_MODE_TREE, &KF_Y_MODE_PROBS, DC_MODE, 0);
             first_partition.write_tree(&UV_MODE_TREE, &KF_UV_MODE_PROBS, DC_MODE, 0);
 
-            let luma_prediction = predict_luma_dc(
+            let luma_prediction = predict_luma(
                 &reconstruction.y,
                 reconstruction.y_stride,
                 macroblock_x,
                 macroblock_y,
             );
-            let u_prediction = predict_chroma_dc(
+            let u_prediction = predict_chroma(
                 &reconstruction.u,
                 reconstruction.chroma_stride,
                 macroblock_x,
                 macroblock_y,
             );
-            let v_prediction = predict_chroma_dc(
+            let v_prediction = predict_chroma(
                 &reconstruction.v,
                 reconstruction.chroma_stride,
                 macroblock_x,
