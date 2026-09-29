@@ -1,7 +1,8 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::bool_coder::BoolEncoder;
+use crate::bool_coder::{tree_writes, BoolEncoder};
+use crate::quantize::BIT_COST;
 
 const PLANE_Y_AFTER_Y2: usize = 0;
 const PLANE_Y2: usize = 1;
@@ -172,6 +173,254 @@ pub(crate) struct MacroblockResidual {
     pub(crate) v: [[i16; 16]; 4],
 }
 
+pub(crate) struct TokenStatistics {
+    counts: [[u64; 2]; COEFF_PROB_COUNT],
+    fixed_cost: u64,
+    coded: u64,
+    total: u64,
+}
+
+impl Default for TokenStatistics {
+    fn default() -> Self {
+        Self {
+            counts: [[0; 2]; COEFF_PROB_COUNT],
+            fixed_cost: 0,
+            coded: 0,
+            total: 0,
+        }
+    }
+}
+
+impl TokenStatistics {
+    pub(crate) fn writer<'a, W: EntropyWriter>(
+        &'a mut self,
+        writer: &'a mut W,
+    ) -> impl EntropyWriter + 'a {
+        CountingWriter {
+            writer,
+            statistics: self,
+        }
+    }
+
+    pub(crate) fn record_macroblock(&mut self, residual: &MacroblockResidual, has_y2: bool) {
+        let nonzero = (has_y2 && residual.y2.iter().any(|&level| level != 0))
+            || residual
+                .y
+                .iter()
+                .any(|block| block[usize::from(has_y2)..].iter().any(|&level| level != 0))
+            || residual
+                .u
+                .iter()
+                .chain(&residual.v)
+                .flatten()
+                .any(|&level| level != 0);
+        self.coded += u64::from(nonzero);
+        self.total += 1;
+    }
+
+    pub(crate) fn skip_probability(&self) -> Option<u8> {
+        if self.coded == self.total {
+            None
+        } else {
+            candidate_probability([self.coded, self.total - self.coded])
+        }
+    }
+
+    pub(crate) fn probabilities(&self) -> [u8; COEFF_PROB_COUNT] {
+        core::array::from_fn(|index| {
+            updated_probability(
+                self.counts[index],
+                DEFAULT_COEFF_PROBS[index],
+                COEFF_UPDATE_PROBS[index],
+            )
+        })
+    }
+}
+
+fn candidate_probability([zero, one]: [u64; 2]) -> Option<u8> {
+    let total = zero + one;
+    (total != 0).then(|| ((255 * zero + total / 2) / total).clamp(1, 255) as u8)
+}
+
+fn bool_cost(probability: u8, value: bool) -> u64 {
+    let index = if value {
+        256 - usize::from(probability)
+    } else {
+        usize::from(probability)
+    };
+    u64::from(BIT_COST[index])
+}
+
+fn updated_probability(counts: [u64; 2], default: u8, update: u8) -> u8 {
+    match update_costs(counts, default, update) {
+        Some((candidate, keep, change)) if keep > change => candidate,
+        _ => default,
+    }
+}
+
+fn update_costs(counts: [u64; 2], default: u8, update: u8) -> Option<(u8, u64, u64)> {
+    let candidate = candidate_probability(counts)?;
+    let data_cost = |probability| {
+        counts[0] * bool_cost(probability, false) + counts[1] * bool_cost(probability, true)
+    };
+    let keep = data_cost(default) + bool_cost(update, false);
+    let change = data_cost(candidate) + bool_cost(update, true) + 8 * 256;
+    Some((candidate, keep, change))
+}
+
+struct CountingWriter<'a, W> {
+    writer: &'a mut W,
+    statistics: &'a mut TokenStatistics,
+}
+
+impl<W: EntropyWriter> EntropyWriter for CountingWriter<'_, W> {
+    fn write_bool(&mut self, probability: u8, value: bool) {
+        self.statistics.fixed_cost += bool_cost(probability, value);
+        self.writer.write_bool(probability, value);
+    }
+
+    fn write_tree(&mut self, tree: &[i8], probabilities: &[u8], value: u8, start_node: usize) {
+        self.writer
+            .write_tree(tree, probabilities, value, start_node);
+    }
+
+    fn write_coefficient_token(&mut self, start: usize, token: u8, start_node: usize) {
+        // RFC 6386 section 13.3 indexes each probability by half the tree node.
+        let nodes = core::array::from_fn::<_, TREE_NODE_COUNT, _>(|index| index as u8);
+        let (branches, length) = tree_writes(&COEFF_TREE, &nodes, token, start_node);
+        for &(node, value) in &branches[..length] {
+            self.statistics.counts[start + usize::from(node)][usize::from(value)] += 1;
+        }
+        self.writer
+            .write_coefficient_token(start, token, start_node);
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TokenMacroblock {
+    pub(crate) luma_mode: u8,
+    pub(crate) chroma_mode: u8,
+    pub(crate) subblock_modes: [u8; 16],
+    pub(crate) residual: MacroblockResidual,
+}
+
+pub(crate) struct TokenStream {
+    bytes: Vec<u8>,
+}
+
+impl TokenStream {
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(capacity),
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.bytes.clear();
+    }
+
+    pub(crate) fn push(&mut self, block: &TokenMacroblock) {
+        let has_y2 = block.luma_mode != 4;
+        self.bytes.push(block.luma_mode | block.chroma_mode << 3);
+        if has_y2 {
+            self.push_block(&block.residual.y2, 0);
+        } else {
+            for pair in block.subblock_modes.chunks_exact(2) {
+                self.bytes.push(pair[0] | pair[1] << 4);
+            }
+        }
+        for levels in &block.residual.y {
+            self.push_block(levels, usize::from(has_y2));
+        }
+        for levels in block.residual.u.iter().chain(&block.residual.v) {
+            self.push_block(levels, 0);
+        }
+    }
+
+    fn push_block(&mut self, levels: &[i16; 16], first: usize) {
+        let end = (first..16)
+            .rev()
+            .find(|&position| levels[ZIGZAG[position]] != 0)
+            .map_or(first, |position| position + 1);
+        self.bytes.push(end as u8);
+        for &raster in &ZIGZAG[first..end] {
+            let level = levels[raster];
+            // Magnitude * 2 + sign fits in thirteen bits at the section 13.2 limit.
+            let value = (level.unsigned_abs().min(2114) << 1) | u16::from(level < 0);
+            if value < 128 {
+                self.bytes.push(value as u8);
+            } else {
+                self.bytes.push((value as u8 & 127) | 128);
+                self.bytes.push((value >> 7) as u8);
+            }
+        }
+    }
+
+    pub(crate) fn reader(&self) -> TokenReader<'_> {
+        TokenReader { bytes: &self.bytes }
+    }
+}
+
+pub(crate) struct TokenReader<'a> {
+    bytes: &'a [u8],
+}
+
+impl TokenReader<'_> {
+    pub(crate) fn next_macroblock(&mut self) -> Option<TokenMacroblock> {
+        let (&modes, rest) = self.bytes.split_first()?;
+        self.bytes = rest;
+        let mut block = TokenMacroblock {
+            luma_mode: modes & 7,
+            chroma_mode: modes >> 3,
+            ..TokenMacroblock::default()
+        };
+        let has_y2 = block.luma_mode != 4;
+        if has_y2 {
+            block.residual.y2 = self.read_block(0);
+        } else {
+            for pair in block.subblock_modes.chunks_exact_mut(2) {
+                let packed = self.byte();
+                pair[0] = packed & 15;
+                pair[1] = packed >> 4;
+            }
+        }
+        for levels in &mut block.residual.y {
+            *levels = self.read_block(usize::from(has_y2));
+        }
+        for levels in block.residual.u.iter_mut().chain(&mut block.residual.v) {
+            *levels = self.read_block(0);
+        }
+        Some(block)
+    }
+
+    fn byte(&mut self) -> u8 {
+        let byte = self.bytes[0];
+        self.bytes = &self.bytes[1..];
+        byte
+    }
+
+    fn read_block(&mut self, first: usize) -> [i16; 16] {
+        let end = usize::from(self.byte());
+        let mut levels = [0; 16];
+        for &raster in &ZIGZAG[first..end] {
+            let low = self.byte();
+            let value = u16::from(low & 127)
+                | if low & 128 != 0 {
+                    u16::from(self.byte()) << 7
+                } else {
+                    0
+                };
+            let magnitude = (value >> 1) as i16;
+            levels[raster] = if value & 1 != 0 {
+                -magnitude
+            } else {
+                magnitude
+            };
+        }
+        levels
+    }
+}
+
 pub(crate) struct ResidualWriter {
     above_y: Vec<bool>,
     above_u: Vec<bool>,
@@ -197,9 +446,9 @@ impl ResidualWriter {
         }
     }
 
-    pub(crate) fn write_macroblock(
+    pub(crate) fn write_macroblock<W: EntropyWriter>(
         &mut self,
-        encoder: &mut BoolEncoder,
+        encoder: &mut W,
         macroblock_x: usize,
         residual: &MacroblockResidual,
     ) {
@@ -336,9 +585,10 @@ fn write_token<W: EntropyWriter>(
     context: usize,
     skip_end_branch: bool,
 ) {
-    let probabilities = coefficient_probabilities(plane, COEFF_BANDS[position], context);
+    let start =
+        ((plane * BAND_COUNT + COEFF_BANDS[position]) * CONTEXT_COUNT + context) * TREE_NODE_COUNT;
     let start_node = if skip_end_branch { 2 } else { 0 };
-    writer.write_tree(&COEFF_TREE, probabilities, token, start_node);
+    writer.write_coefficient_token(start, token, start_node);
 }
 
 fn write_extra_bits<W: EntropyWriter>(writer: &mut W, magnitude: u16, token: u8) {
@@ -383,13 +633,23 @@ fn magnitude_context(magnitude: u16) -> usize {
     }
 }
 
+#[cfg(test)]
 fn coefficient_probabilities(plane: usize, band: usize, context: usize) -> &'static [u8] {
     let start = ((plane * BAND_COUNT + band) * CONTEXT_COUNT + context) * TREE_NODE_COUNT;
     &DEFAULT_COEFF_PROBS[start..start + TREE_NODE_COUNT]
 }
 
-trait EntropyWriter {
+pub(crate) trait EntropyWriter {
     fn write_bool(&mut self, probability: u8, value: bool);
+
+    fn write_coefficient_token(&mut self, start: usize, token: u8, start_node: usize) {
+        self.write_tree(
+            &COEFF_TREE,
+            &DEFAULT_COEFF_PROBS[start..start + TREE_NODE_COUNT],
+            token,
+            start_node,
+        );
+    }
 
     fn write_tree(&mut self, tree: &[i8], probabilities: &[u8], value: u8, start_node: usize);
 }
@@ -872,5 +1132,245 @@ mod tests {
             );
         }
         assert_eq!(reader.first_contexts_seen, [true; 3]);
+    }
+
+    #[test]
+    fn candidate_probabilities_round_and_saturate_at_both_ends() {
+        for (counts, expected) in [
+            ([0, 0], None),
+            ([1, 0], Some(255)),
+            ([0, 1], Some(1)),
+            ([1, 1], Some(128)),
+            ([1, 2], Some(85)),
+            ([2, 1], Some(170)),
+            ([1, 1000], Some(1)),
+            ([1000, 1], Some(255)),
+            ([16_777_216, 16_777_216], Some(128)),
+        ] {
+            assert_eq!(candidate_probability(counts), expected);
+        }
+    }
+
+    #[test]
+    fn skewed_counts_send_updates_and_balanced_counts_keep_exact_costs() {
+        assert_eq!(update_costs([0, 0], 128, 255), None);
+        assert_eq!(update_costs([1000, 0], 128, 255), Some((255, 256001, 5096)));
+        assert_eq!(update_costs([0, 1000], 128, 255), Some((1, 256001, 5096)));
+        assert_eq!(
+            update_costs([100, 100], 128, 255),
+            Some((128, 51201, 55296))
+        );
+        let mut statistics = TokenStatistics::default();
+        statistics.counts[0] = [1000, 0];
+        statistics.counts[1] = [100, 100];
+        statistics.counts[2] = [0, 1000];
+        let mut expected = DEFAULT_COEFF_PROBS;
+        expected[0] = 255;
+        expected[2] = 1;
+        assert_eq!(statistics.probabilities(), expected);
+    }
+
+    #[test]
+    fn equal_update_costs_keep_the_default_probability() {
+        assert_eq!(update_costs([15, 0], 122, 255), Some((255, 4111, 4111)));
+        assert_eq!(updated_probability([15, 0], 122, 255), 122);
+    }
+
+    #[test]
+    fn skip_probabilities_count_only_the_levels_the_macroblock_codes() {
+        let mut statistics = TokenStatistics::default();
+        assert_eq!(statistics.skip_probability(), None);
+        let mut residual = MacroblockResidual::default();
+        residual.y[0][0] = 7;
+        statistics.record_macroblock(&residual, false);
+        assert_eq!(
+            (
+                statistics.coded,
+                statistics.total,
+                statistics.skip_probability()
+            ),
+            (1, 1, None)
+        );
+        statistics.record_macroblock(&residual, true);
+        assert_eq!(
+            (
+                statistics.coded,
+                statistics.total,
+                statistics.skip_probability()
+            ),
+            (1, 2, Some(128))
+        );
+        residual.y[0][0] = 0;
+        residual.y2[0] = 9;
+        statistics.record_macroblock(&residual, false);
+        assert_eq!(
+            (
+                statistics.coded,
+                statistics.total,
+                statistics.skip_probability()
+            ),
+            (1, 3, Some(85))
+        );
+        statistics.record_macroblock(&residual, true);
+        assert_eq!(
+            (
+                statistics.coded,
+                statistics.total,
+                statistics.skip_probability()
+            ),
+            (2, 4, Some(128))
+        );
+        let mut empty = TokenStatistics::default();
+        empty.record_macroblock(&MacroblockResidual::default(), true);
+        assert_eq!(empty.skip_probability(), Some(1));
+        for _ in 0..999 {
+            empty.record_macroblock(&residual, true);
+        }
+        assert_eq!(empty.skip_probability(), Some(255));
+    }
+
+    #[test]
+    fn a_hand_count_matches_every_touched_coefficient_node() {
+        let mut stream = TokenStream::with_capacity(1024);
+        let mut block = TokenMacroblock::default();
+        block.residual.y2[ZIGZAG[1]] = 1;
+        block.residual.y2[ZIGZAG[2]] = -5;
+        stream.push(&block);
+        stream.push(&TokenMacroblock::default());
+        stream.push(&TokenMacroblock::default());
+        let mut reader = stream.reader();
+        let mut statistics = TokenStatistics::default();
+        let mut trace = TraceWriter::default();
+        let mut writer = ResidualWriter::new(2);
+        for column in [0, 1, 0] {
+            let stored = reader.next_macroblock().unwrap();
+            writer.write_macroblock(&mut statistics.writer(&mut trace), column, &stored.residual);
+        }
+        let mut expected = [[0; 2]; COEFF_PROB_COUNT];
+        let mut set = |plane: usize, band: usize, context: usize, node: usize, counts| {
+            expected[((plane * 8 + band) * 3 + context) * 11 + node] = counts;
+        };
+        set(1, 0, 0, 0, [0, 1]);
+        set(1, 0, 0, 1, [1, 0]);
+        set(1, 1, 0, 1, [0, 1]);
+        set(1, 1, 0, 2, [1, 0]);
+        for node in [0, 1, 2, 3] {
+            set(1, 2, 1, node, [0, 1]);
+        }
+        for node in [6, 7] {
+            set(1, 2, 1, node, [1, 0]);
+        }
+        set(1, 3, 2, 0, [1, 0]);
+        set(1, 0, 1, 0, [2, 0]);
+        set(0, 1, 0, 0, [48, 0]);
+        set(2, 0, 0, 0, [24, 0]);
+        assert_eq!(statistics.counts, expected);
+        assert_eq!(statistics.fixed_cost, 688);
+        assert_eq!(reader.next_macroblock(), None);
+    }
+
+    #[test]
+    fn seeded_streams_match_direct_residual_writes_bool_for_bool() {
+        let mut seed = 0x739b_261d;
+        let blocks: Vec<_> = (0..100)
+            .map(|_| TokenMacroblock {
+                residual: seeded_macroblock(&mut seed),
+                ..TokenMacroblock::default()
+            })
+            .collect();
+        let mut stream = TokenStream::with_capacity(blocks.len() * 826);
+        let capacity = stream.bytes.capacity();
+        let mut direct = ResidualWriter::new(5);
+        let mut expected = TraceWriter::default();
+        for (index, block) in blocks.iter().enumerate() {
+            direct.write_macroblock(&mut expected, index % 5, &block.residual);
+            stream.push(block);
+        }
+        assert_eq!(stream.bytes.capacity(), capacity);
+        let mut reader = stream.reader();
+        let mut replay = ResidualWriter::new(5);
+        let mut statistics = TokenStatistics::default();
+        let mut actual = TraceWriter::default();
+        for (index, expected_block) in blocks.iter().enumerate() {
+            let block = reader.next_macroblock().unwrap();
+            assert_eq!(block, *expected_block);
+            replay.write_macroblock(
+                &mut statistics.writer(&mut actual),
+                index % 5,
+                &block.residual,
+            );
+        }
+        assert_eq!(actual.writes, expected.writes);
+        assert_eq!(ContextState::from(&replay), ContextState::from(&direct));
+        assert_eq!(reader.next_macroblock(), None);
+    }
+
+    #[test]
+    fn every_seeded_macroblock_round_trips_modes_and_coded_levels() {
+        let mut seed = 0x7be2_1635;
+        let mut expected = Vec::new();
+        let mut stream = TokenStream::with_capacity(5 * 4 * 17 * 826);
+        for luma_mode in 0..5 {
+            for chroma_mode in 0..4 {
+                for sparsity in 0..17 {
+                    let mut block = TokenMacroblock {
+                        luma_mode,
+                        chroma_mode,
+                        ..TokenMacroblock::default()
+                    };
+                    if luma_mode == 4 {
+                        for mode in &mut block.subblock_modes {
+                            *mode = (next_seed(&mut seed) % 10) as u8;
+                        }
+                    } else {
+                        fill_block(&mut block.residual.y2, 0, sparsity, &mut seed);
+                    }
+                    for levels in &mut block.residual.y {
+                        fill_block(levels, usize::from(luma_mode != 4), sparsity, &mut seed);
+                    }
+                    for levels in block.residual.u.iter_mut().chain(&mut block.residual.v) {
+                        fill_block(levels, 0, sparsity, &mut seed);
+                    }
+                    stream.push(&block);
+                    expected.push(block);
+                }
+            }
+        }
+        let mut reader = stream.reader();
+        for block in expected {
+            assert_eq!(reader.next_macroblock(), Some(block));
+        }
+        assert_eq!(reader.next_macroblock(), None);
+    }
+
+    #[test]
+    fn compact_blocks_store_only_coded_positions_through_the_last_nonzero() {
+        let mut stream = TokenStream::with_capacity(826);
+        stream.push(&TokenMacroblock::default());
+        assert_eq!(stream.bytes, [vec![0, 0], vec![1; 16], vec![0; 8]].concat());
+        stream.clear();
+        let mut block = TokenMacroblock::default();
+        block.residual.y2[0] = 1;
+        block.residual.y2[1] = -64;
+        stream.push(&block);
+        assert_eq!(&stream.bytes[..5], &[0, 2, 2, 129, 1]);
+        assert_eq!(stream.bytes.len(), 29);
+        assert_eq!(stream.reader().next_macroblock(), Some(block));
+        stream.clear();
+        assert_eq!(stream.reader().next_macroblock(), None);
+        assert_eq!(stream.bytes.capacity(), 826);
+    }
+
+    #[test]
+    fn stream_levels_saturate_at_the_coefficient_category_limit() {
+        let mut stream = TokenStream::with_capacity(826);
+        let mut block = TokenMacroblock::default();
+        block.residual.y2[0] = i16::MAX;
+        block.residual.y2[1] = i16::MIN;
+        stream.push(&block);
+        block.residual.y2[0] = 2114;
+        block.residual.y2[1] = -2114;
+        assert_eq!(&stream.bytes[..6], &[0, 2, 132, 33, 133, 33]);
+        assert_eq!(stream.reader().next_macroblock(), Some(block));
     }
 }

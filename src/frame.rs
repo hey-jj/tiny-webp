@@ -4,9 +4,10 @@ use alloc::vec::Vec;
 use crate::bool_coder::BoolEncoder;
 use crate::color::{convert, YuvPlanes};
 use crate::prediction::{predict_chroma, predict_luma};
-use crate::quantize::{dequantize_block, factors, quantize_block, QuantizationFactors, BIT_COST};
+use crate::quantize::{dequantize_block, factors, quantize_block, QuantizationFactors};
 use crate::residual::{
-    MacroblockResidual, ResidualWriter, COEFF_UPDATE_PROBS, DEFAULT_COEFF_PROBS,
+    MacroblockResidual, ResidualWriter, TokenMacroblock, TokenStatistics, TokenStream,
+    COEFF_UPDATE_PROBS, DEFAULT_COEFF_PROBS,
 };
 use crate::transform::{clamped_add, forward_dct, forward_wht, inverse_dct, inverse_wht};
 use crate::{Alpha, Filter, Options};
@@ -179,20 +180,14 @@ pub(crate) fn encode(
     let mut first_partition = BoolEncoder::with_capacity(160 + macroblock_count.div_ceil(2));
     let mut second_partition = BoolEncoder::with_capacity(width * height);
     let mut residual_writer = ResidualWriter::new(macroblock_columns);
+    let mut tokens = TokenStream::with_capacity(1 + 25 * 33);
+    let mut statistics = TokenStatistics::default();
     let quantization = factors(quantizer_index);
     let mut mode_writer = ModeWriter::new(macroblock_columns);
 
     write_frame_header(&mut first_partition, quantizer_index, options.filter);
     for macroblock_y in 0..macroblock_rows {
         for macroblock_x in 0..macroblock_columns {
-            mode_writer.write_macroblock(
-                &mut first_partition,
-                macroblock_x,
-                DC_MODE,
-                DC_MODE,
-                &[0; 16],
-            );
-
             let luma_prediction = predict_luma(
                 &reconstruction.y,
                 reconstruction.y_stride,
@@ -239,7 +234,30 @@ pub(crate) fn encode(
                 quantization,
                 &mut residual.v,
             );
-            residual_writer.write_macroblock(&mut second_partition, macroblock_x, &residual);
+            tokens.clear();
+            tokens.push(&TokenMacroblock {
+                luma_mode: DC_MODE,
+                chroma_mode: DC_MODE,
+                subblock_modes: [0; 16],
+                residual,
+            });
+            let stored = tokens
+                .reader()
+                .next_macroblock()
+                .expect("the stream holds one macroblock");
+            mode_writer.write_macroblock(
+                &mut first_partition,
+                macroblock_x,
+                stored.luma_mode,
+                stored.chroma_mode,
+                &stored.subblock_modes,
+            );
+            statistics.record_macroblock(&stored.residual, true);
+            residual_writer.write_macroblock(
+                &mut statistics.writer(&mut second_partition),
+                macroblock_x,
+                &stored.residual,
+            );
         }
     }
 
@@ -290,15 +308,24 @@ fn write_frame_header(encoder: &mut BoolEncoder, quantizer_index: u8, filter: Fi
     // RFC 6386 section 19.2 retains token probabilities with refresh_entropy_probs 1.
     encoder.write_literal(1, 1);
     // RFC 6386 section 13.4 retains each default with token_prob_update 0.
-    for (probability, default) in COEFF_UPDATE_PROBS.into_iter().zip(DEFAULT_COEFF_PROBS) {
-        let update = probability_update_saves_bits([0, 0], default, default, probability);
+    let statistics = TokenStatistics::default();
+    for ((probability, default), selected) in COEFF_UPDATE_PROBS
+        .into_iter()
+        .zip(DEFAULT_COEFF_PROBS)
+        .zip(statistics.probabilities())
+    {
+        let update = selected != default;
         encoder.write_bool(probability, update);
         if update {
-            encoder.write_literal(u32::from(default), 8);
+            encoder.write_literal(u32::from(selected), 8);
         }
     }
-    // RFC 6386 section 9.11 requires every residual when mb_no_skip_coeff is 0.
-    encoder.write_literal(0, 1);
+    // RFC 6386 section 9.11 requires a probability when mb_no_skip_coeff is 1.
+    let skip_probability = statistics.skip_probability();
+    encoder.write_bool(128, skip_probability.is_some());
+    if let Some(probability) = skip_probability {
+        encoder.write_literal(u32::from(probability), 8);
+    }
 }
 
 struct ModeWriter {
@@ -361,17 +388,6 @@ impl ModeWriter {
 fn derived_subblock_mode(luma_mode: u8) -> u8 {
     // RFC 6386 section 11.3 maps each whole-block mode to a sub-block context.
     [0, 2, 3, 1][usize::from(luma_mode)]
-}
-
-fn probability_update_saves_bits(counts: [u64; 2], default: u8, candidate: u8, update: u8) -> bool {
-    let cost = |probability: u8| u64::from(BIT_COST[usize::from(probability)]);
-    let data_cost = |probability: u8| {
-        counts[0] * cost(probability)
-            + counts[1] * u64::from(BIT_COST[256 - usize::from(probability)])
-    };
-    let keep = data_cost(default) + cost(update);
-    let change = data_cost(candidate) + u64::from(BIT_COST[256 - usize::from(update)]) + 8 * 256;
-    keep > change
 }
 
 fn analyze_luma(
@@ -822,22 +838,10 @@ mod tests {
 
     #[test]
     fn empty_counts_keep_every_default_probability() {
-        for (default, update) in crate::residual::DEFAULT_COEFF_PROBS
-            .into_iter()
-            .zip(crate::residual::COEFF_UPDATE_PROBS)
-        {
-            for candidate in 1..=255 {
-                assert_eq!(
-                    u8::from(super::probability_update_saves_bits(
-                        [0, 0],
-                        default,
-                        candidate,
-                        update
-                    )),
-                    0
-                );
-            }
-        }
+        assert_eq!(
+            super::TokenStatistics::default().probabilities(),
+            crate::residual::DEFAULT_COEFF_PROBS
+        );
     }
 
     #[test]
