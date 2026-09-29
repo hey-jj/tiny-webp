@@ -18,3 +18,19 @@ fn the_quality_lookup_regenerates_from_the_cube_root_formula() {
     });
     assert_eq!(generated, quantize::Q_TO_INDEX);
 }
+
+#[test]
+fn every_bit_cost_regenerates_from_the_binary_logarithm() {
+    let generated = core::array::from_fn(|probability| {
+        if probability == 0 {
+            2048
+        } else {
+            (-256.0 * (probability as f64 / 256.0).log2()).round() as u16
+        }
+    });
+    assert_eq!(quantize::BIT_COST.len(), 256);
+    assert_eq!(quantize::BIT_COST[0], 2048);
+    assert_eq!(quantize::BIT_COST[1], 2048);
+    assert_eq!(quantize::BIT_COST[255], 1);
+    assert_eq!(generated, quantize::BIT_COST);
+}

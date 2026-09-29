@@ -4,12 +4,15 @@ use alloc::vec::Vec;
 use crate::bool_coder::BoolEncoder;
 use crate::color::{convert, YuvPlanes};
 use crate::prediction::{predict_chroma, predict_luma};
-use crate::quantize::{dequantize_block, factors, quantize_block, QuantizationFactors};
-use crate::residual::{MacroblockResidual, ResidualWriter, COEFF_UPDATE_PROBS};
+use crate::quantize::{dequantize_block, factors, quantize_block, QuantizationFactors, BIT_COST};
+use crate::residual::{
+    MacroblockResidual, ResidualWriter, COEFF_UPDATE_PROBS, DEFAULT_COEFF_PROBS,
+};
 use crate::transform::{clamped_add, forward_dct, forward_wht, inverse_dct, inverse_wht};
 use crate::{Alpha, Filter, Options};
 
 const DC_MODE: u8 = 0;
+const SUBBLOCK_MODE: u8 = 4;
 
 // RFC 6386 section 11.2 defines the key-frame luma mode tree and probabilities.
 pub(crate) const KF_Y_MODE_TREE: [i8; 8] = [-4, 2, 4, 6, 0, -1, -2, -3];
@@ -18,6 +21,135 @@ pub(crate) const KF_Y_MODE_PROBS: [u8; 4] = [145, 156, 163, 128];
 // RFC 6386 section 11.4 defines the chroma mode tree and probabilities.
 pub(crate) const UV_MODE_TREE: [i8; 6] = [0, 2, -1, 4, -2, -3];
 pub(crate) const KF_UV_MODE_PROBS: [u8; 3] = [142, 114, 183];
+
+// RFC 6386 section 11.2 fixes the sub-block tree leaf numbering.
+const B_MODE_TREE: [i8; 18] = [
+    0, 2, -1, 4, -2, 6, 8, 12, -3, 10, -5, -6, -4, 14, -7, 16, -8, -9,
+];
+
+// RFC 6386 section 11.5 indexes these probabilities by above and left modes.
+const KF_B_MODE_PROBS: [[[u8; 9]; 10]; 10] = [
+    [
+        [231, 120, 48, 89, 115, 113, 120, 152, 112],
+        [152, 179, 64, 126, 170, 118, 46, 70, 95],
+        [175, 69, 143, 80, 85, 82, 72, 155, 103],
+        [56, 58, 10, 171, 218, 189, 17, 13, 152],
+        [144, 71, 10, 38, 171, 213, 144, 34, 26],
+        [114, 26, 17, 163, 44, 195, 21, 10, 173],
+        [121, 24, 80, 195, 26, 62, 44, 64, 85],
+        [170, 46, 55, 19, 136, 160, 33, 206, 71],
+        [63, 20, 8, 114, 114, 208, 12, 9, 226],
+        [81, 40, 11, 96, 182, 84, 29, 16, 36],
+    ],
+    [
+        [134, 183, 89, 137, 98, 101, 106, 165, 148],
+        [72, 187, 100, 130, 157, 111, 32, 75, 80],
+        [66, 102, 167, 99, 74, 62, 40, 234, 128],
+        [41, 53, 9, 178, 241, 141, 26, 8, 107],
+        [104, 79, 12, 27, 217, 255, 87, 17, 7],
+        [74, 43, 26, 146, 73, 166, 49, 23, 157],
+        [65, 38, 105, 160, 51, 52, 31, 115, 128],
+        [87, 68, 71, 44, 114, 51, 15, 186, 23],
+        [47, 41, 14, 110, 182, 183, 21, 17, 194],
+        [66, 45, 25, 102, 197, 189, 23, 18, 22],
+    ],
+    [
+        [88, 88, 147, 150, 42, 46, 45, 196, 205],
+        [43, 97, 183, 117, 85, 38, 35, 179, 61],
+        [39, 53, 200, 87, 26, 21, 43, 232, 171],
+        [56, 34, 51, 104, 114, 102, 29, 93, 77],
+        [107, 54, 32, 26, 51, 1, 81, 43, 31],
+        [39, 28, 85, 171, 58, 165, 90, 98, 64],
+        [34, 22, 116, 206, 23, 34, 43, 166, 73],
+        [68, 25, 106, 22, 64, 171, 36, 225, 114],
+        [34, 19, 21, 102, 132, 188, 16, 76, 124],
+        [62, 18, 78, 95, 85, 57, 50, 48, 51],
+    ],
+    [
+        [193, 101, 35, 159, 215, 111, 89, 46, 111],
+        [60, 148, 31, 172, 219, 228, 21, 18, 111],
+        [112, 113, 77, 85, 179, 255, 38, 120, 114],
+        [40, 42, 1, 196, 245, 209, 10, 25, 109],
+        [100, 80, 8, 43, 154, 1, 51, 26, 71],
+        [88, 43, 29, 140, 166, 213, 37, 43, 154],
+        [61, 63, 30, 155, 67, 45, 68, 1, 209],
+        [142, 78, 78, 16, 255, 128, 34, 197, 171],
+        [41, 40, 5, 102, 211, 183, 4, 1, 221],
+        [51, 50, 17, 168, 209, 192, 23, 25, 82],
+    ],
+    [
+        [125, 98, 42, 88, 104, 85, 117, 175, 82],
+        [95, 84, 53, 89, 128, 100, 113, 101, 45],
+        [75, 79, 123, 47, 51, 128, 81, 171, 1],
+        [57, 17, 5, 71, 102, 57, 53, 41, 49],
+        [115, 21, 2, 10, 102, 255, 166, 23, 6],
+        [38, 33, 13, 121, 57, 73, 26, 1, 85],
+        [41, 10, 67, 138, 77, 110, 90, 47, 114],
+        [101, 29, 16, 10, 85, 128, 101, 196, 26],
+        [57, 18, 10, 102, 102, 213, 34, 20, 43],
+        [117, 20, 15, 36, 163, 128, 68, 1, 26],
+    ],
+    [
+        [138, 31, 36, 171, 27, 166, 38, 44, 229],
+        [67, 87, 58, 169, 82, 115, 26, 59, 179],
+        [63, 59, 90, 180, 59, 166, 93, 73, 154],
+        [40, 40, 21, 116, 143, 209, 34, 39, 175],
+        [57, 46, 22, 24, 128, 1, 54, 17, 37],
+        [47, 15, 16, 183, 34, 223, 49, 45, 183],
+        [46, 17, 33, 183, 6, 98, 15, 32, 183],
+        [65, 32, 73, 115, 28, 128, 23, 128, 205],
+        [40, 3, 9, 115, 51, 192, 18, 6, 223],
+        [87, 37, 9, 115, 59, 77, 64, 21, 47],
+    ],
+    [
+        [104, 55, 44, 218, 9, 54, 53, 130, 226],
+        [64, 90, 70, 205, 40, 41, 23, 26, 57],
+        [54, 57, 112, 184, 5, 41, 38, 166, 213],
+        [30, 34, 26, 133, 152, 116, 10, 32, 134],
+        [75, 32, 12, 51, 192, 255, 160, 43, 51],
+        [39, 19, 53, 221, 26, 114, 32, 73, 255],
+        [31, 9, 65, 234, 2, 15, 1, 118, 73],
+        [88, 31, 35, 67, 102, 85, 55, 186, 85],
+        [56, 21, 23, 111, 59, 205, 45, 37, 192],
+        [55, 38, 70, 124, 73, 102, 1, 34, 98],
+    ],
+    [
+        [102, 61, 71, 37, 34, 53, 31, 243, 192],
+        [69, 60, 71, 38, 73, 119, 28, 222, 37],
+        [68, 45, 128, 34, 1, 47, 11, 245, 171],
+        [62, 17, 19, 70, 146, 85, 55, 62, 70],
+        [75, 15, 9, 9, 64, 255, 184, 119, 16],
+        [37, 43, 37, 154, 100, 163, 85, 160, 1],
+        [63, 9, 92, 136, 28, 64, 32, 201, 85],
+        [86, 6, 28, 5, 64, 255, 25, 248, 1],
+        [56, 8, 17, 132, 137, 255, 55, 116, 128],
+        [58, 15, 20, 82, 135, 57, 26, 121, 40],
+    ],
+    [
+        [164, 50, 31, 137, 154, 133, 25, 35, 218],
+        [51, 103, 44, 131, 131, 123, 31, 6, 158],
+        [86, 40, 64, 135, 148, 224, 45, 183, 128],
+        [22, 26, 17, 131, 240, 154, 14, 1, 209],
+        [83, 12, 13, 54, 192, 255, 68, 47, 28],
+        [45, 16, 21, 91, 64, 222, 7, 1, 197],
+        [56, 21, 39, 155, 60, 138, 23, 102, 213],
+        [85, 26, 85, 85, 128, 128, 32, 146, 171],
+        [18, 11, 7, 63, 144, 171, 4, 4, 246],
+        [35, 27, 10, 146, 174, 171, 12, 26, 128],
+    ],
+    [
+        [190, 80, 35, 99, 180, 80, 126, 54, 45],
+        [85, 126, 47, 87, 176, 51, 41, 20, 32],
+        [101, 75, 128, 139, 118, 146, 116, 128, 85],
+        [56, 41, 15, 176, 236, 85, 37, 9, 62],
+        [146, 36, 19, 30, 171, 255, 97, 27, 20],
+        [71, 30, 17, 119, 118, 255, 17, 18, 138],
+        [101, 38, 60, 138, 55, 70, 43, 26, 142],
+        [138, 45, 61, 62, 219, 1, 81, 188, 64],
+        [32, 41, 20, 117, 151, 142, 20, 21, 163],
+        [112, 19, 12, 61, 195, 128, 48, 4, 24],
+    ],
+];
 
 pub(crate) struct EncodedFrame {
     pub(crate) webp: Vec<u8>,
@@ -48,12 +180,18 @@ pub(crate) fn encode(
     let mut second_partition = BoolEncoder::with_capacity(width * height);
     let mut residual_writer = ResidualWriter::new(macroblock_columns);
     let quantization = factors(quantizer_index);
+    let mut mode_writer = ModeWriter::new(macroblock_columns);
 
     write_frame_header(&mut first_partition, quantizer_index, options.filter);
     for macroblock_y in 0..macroblock_rows {
         for macroblock_x in 0..macroblock_columns {
-            first_partition.write_tree(&KF_Y_MODE_TREE, &KF_Y_MODE_PROBS, DC_MODE, 0);
-            first_partition.write_tree(&UV_MODE_TREE, &KF_UV_MODE_PROBS, DC_MODE, 0);
+            mode_writer.write_macroblock(
+                &mut first_partition,
+                macroblock_x,
+                DC_MODE,
+                DC_MODE,
+                &[0; 16],
+            );
 
             let luma_prediction = predict_luma(
                 &reconstruction.y,
@@ -152,11 +290,88 @@ fn write_frame_header(encoder: &mut BoolEncoder, quantizer_index: u8, filter: Fi
     // RFC 6386 section 19.2 retains token probabilities with refresh_entropy_probs 1.
     encoder.write_literal(1, 1);
     // RFC 6386 section 13.4 retains each default with token_prob_update 0.
-    for probability in COEFF_UPDATE_PROBS {
-        encoder.write_bool(probability, false);
+    for (probability, default) in COEFF_UPDATE_PROBS.into_iter().zip(DEFAULT_COEFF_PROBS) {
+        let update = probability_update_saves_bits([0, 0], default, default, probability);
+        encoder.write_bool(probability, update);
+        if update {
+            encoder.write_literal(u32::from(default), 8);
+        }
     }
     // RFC 6386 section 9.11 requires every residual when mb_no_skip_coeff is 0.
     encoder.write_literal(0, 1);
+}
+
+struct ModeWriter {
+    above: Vec<u8>,
+    left: [u8; 4],
+}
+
+impl ModeWriter {
+    fn new(macroblock_columns: usize) -> Self {
+        Self {
+            above: vec![0; macroblock_columns * 4],
+            left: [0; 4],
+        }
+    }
+
+    fn write_macroblock(
+        &mut self,
+        encoder: &mut BoolEncoder,
+        macroblock_x: usize,
+        luma_mode: u8,
+        chroma_mode: u8,
+        subblock_modes: &[u8; 16],
+    ) {
+        // RFC 6386 section 11.3 gives missing left neighbors the DC mode.
+        if macroblock_x == 0 {
+            self.left.fill(0);
+        }
+        encoder.write_tree(&KF_Y_MODE_TREE, &KF_Y_MODE_PROBS, luma_mode, 0);
+        if luma_mode == SUBBLOCK_MODE {
+            self.write_subblock_modes(encoder, macroblock_x, subblock_modes);
+        } else {
+            let derived = derived_subblock_mode(luma_mode);
+            self.above[macroblock_x * 4..macroblock_x * 4 + 4].fill(derived);
+            self.left.fill(derived);
+        }
+        encoder.write_tree(&UV_MODE_TREE, &KF_UV_MODE_PROBS, chroma_mode, 0);
+    }
+
+    fn probabilities(&self, column: usize, row: usize) -> &'static [u8; 9] {
+        &KF_B_MODE_PROBS[usize::from(self.above[column])][usize::from(self.left[row])]
+    }
+
+    fn write_subblock_modes(
+        &mut self,
+        encoder: &mut BoolEncoder,
+        macroblock_x: usize,
+        modes: &[u8; 16],
+    ) {
+        for (block, &mode) in modes.iter().enumerate() {
+            let column = macroblock_x * 4 + block % 4;
+            let row = block / 4;
+            encoder.write_tree(&B_MODE_TREE, self.probabilities(column, row), mode, 0);
+            // RFC 6386 section 11.3 uses the preceding raster neighbors.
+            self.above[column] = mode;
+            self.left[row] = mode;
+        }
+    }
+}
+
+fn derived_subblock_mode(luma_mode: u8) -> u8 {
+    // RFC 6386 section 11.3 maps each whole-block mode to a sub-block context.
+    [0, 2, 3, 1][usize::from(luma_mode)]
+}
+
+fn probability_update_saves_bits(counts: [u64; 2], default: u8, candidate: u8, update: u8) -> bool {
+    let cost = |probability: u8| u64::from(BIT_COST[usize::from(probability)]);
+    let data_cost = |probability: u8| {
+        counts[0] * cost(probability)
+            + counts[1] * u64::from(BIT_COST[256 - usize::from(probability)])
+    };
+    let keep = data_cost(default) + cost(update);
+    let change = data_cost(candidate) + u64::from(BIT_COST[256 - usize::from(update)]) + 8 * 256;
+    keep > change
 }
 
 fn analyze_luma(
@@ -460,6 +675,169 @@ mod tests {
             [(145, true), (156, false), (163, false)]
         );
         assert_eq!(path(&UV_MODE_TREE, &KF_UV_MODE_PROBS, 0), [(142, false)]);
+    }
+
+    #[test]
+    fn the_subblock_probability_table_matches_every_dimension_and_checksum() {
+        assert_eq!(super::KF_B_MODE_PROBS.len(), 10);
+        for above in super::KF_B_MODE_PROBS {
+            assert_eq!(above.len(), 10);
+            for left in above {
+                assert_eq!(left.len(), 9);
+            }
+        }
+        let entries: Vec<u8> = super::KF_B_MODE_PROBS
+            .into_iter()
+            .flatten()
+            .flatten()
+            .collect();
+        assert_eq!(entries.len(), 900);
+        assert_eq!(entries.first(), Some(&231));
+        assert_eq!(entries.last(), Some(&24));
+        assert_eq!(
+            entries.iter().map(|&value| u32::from(value)).sum::<u32>(),
+            77557
+        );
+    }
+
+    #[test]
+    fn the_subblock_tree_codes_each_mode_with_its_section_11_2_path() {
+        assert_eq!(super::B_MODE_TREE.len(), 18);
+        let paths = [
+            "0", "10", "110", "11100", "11110", "111010", "111011", "111110", "1111110", "1111111",
+        ];
+        for (mode, expected) in paths.into_iter().enumerate() {
+            let trace = path(&super::B_MODE_TREE, &[128; 9], mode as u8);
+            let expected: Vec<(u8, bool)> =
+                expected.bytes().map(|bit| (128, bit == b'1')).collect();
+            assert_eq!(trace, expected, "mode {mode}");
+        }
+    }
+
+    #[test]
+    fn whole_block_modes_set_the_derived_bottom_and_right_contexts() {
+        let mut writer = super::ModeWriter::new(2);
+        let mut encoder = BoolEncoder::new();
+        for (luma, expected) in [0, 2, 3, 1].into_iter().enumerate() {
+            assert_eq!(super::derived_subblock_mode(luma as u8), expected);
+            writer.write_macroblock(&mut encoder, 1, luma as u8, 0, &[9; 16]);
+            assert_eq!(writer.above[..4], [0; 4]);
+            assert_eq!(writer.above[4..], [expected; 4]);
+            assert_eq!(writer.left, [expected; 4]);
+        }
+    }
+
+    #[test]
+    fn the_context_row_and_column_select_above_then_left_probabilities() {
+        let writer = super::ModeWriter {
+            above: vec![1, 2, 3, 4],
+            left: [5, 6, 7, 8],
+        };
+        assert_eq!(
+            *writer.probabilities(0, 0),
+            [74, 43, 26, 146, 73, 166, 49, 23, 157]
+        );
+        assert_eq!(
+            *writer.probabilities(1, 1),
+            [34, 22, 116, 206, 23, 34, 43, 166, 73]
+        );
+        assert_eq!(
+            *writer.probabilities(2, 2),
+            [142, 78, 78, 16, 255, 128, 34, 197, 171]
+        );
+        assert_eq!(
+            *writer.probabilities(3, 3),
+            [57, 18, 10, 102, 102, 213, 34, 20, 43]
+        );
+    }
+
+    #[test]
+    fn subblock_records_follow_raster_neighbors_and_retain_boundary_modes() {
+        let mut writer = super::ModeWriter {
+            above: vec![9, 9, 9, 9, 1, 2, 3, 4],
+            left: [5, 6, 7, 8],
+        };
+        let modes = [1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 1, 2, 3, 4, 5, 6];
+        let neighbors = [
+            (1, 5),
+            (2, 1),
+            (3, 2),
+            (4, 3),
+            (1, 6),
+            (2, 5),
+            (3, 6),
+            (4, 7),
+            (5, 7),
+            (6, 9),
+            (7, 0),
+            (8, 1),
+            (9, 8),
+            (0, 3),
+            (1, 4),
+            (2, 5),
+        ];
+        let mut encoder = BoolEncoder::new();
+        writer.write_macroblock(&mut encoder, 1, 4, 2, &modes);
+        let bytes = encoder.finish();
+        let mut decoder = crate::bool_coder::BoolDecoder::new(&bytes);
+        assert_eq!(decoder.read_tree(&KF_Y_MODE_TREE, &KF_Y_MODE_PROBS, 0), 4);
+        for ((above, left), mode) in neighbors.into_iter().zip(modes) {
+            assert_eq!(
+                decoder.read_tree(&super::B_MODE_TREE, &super::KF_B_MODE_PROBS[above][left], 0),
+                mode
+            );
+        }
+        assert_eq!(decoder.read_tree(&UV_MODE_TREE, &KF_UV_MODE_PROBS, 0), 2);
+        assert_eq!(writer.above, [9, 9, 9, 9, 3, 4, 5, 6]);
+        assert_eq!(writer.left, [4, 8, 2, 6]);
+    }
+
+    #[test]
+    fn frame_and_row_boundaries_use_dc_for_missing_neighbors() {
+        let mut writer = super::ModeWriter::new(2);
+        assert_eq!(writer.above, [0; 8]);
+        assert_eq!(writer.left, [0; 4]);
+        let mut encoder = BoolEncoder::new();
+        writer.write_macroblock(&mut encoder, 0, 1, 0, &[0; 16]);
+        writer.write_macroblock(&mut encoder, 1, 2, 0, &[0; 16]);
+        assert_eq!(writer.above, [2, 2, 2, 2, 3, 3, 3, 3]);
+        assert_eq!(writer.left, [3; 4]);
+        let mut encoder = BoolEncoder::new();
+        writer.write_macroblock(&mut encoder, 0, 4, 0, &[1; 16]);
+        let bytes = encoder.finish();
+        let mut decoder = crate::bool_coder::BoolDecoder::new(&bytes);
+        assert_eq!(decoder.read_tree(&KF_Y_MODE_TREE, &KF_Y_MODE_PROBS, 0), 4);
+        for block in 0..16 {
+            let above = if block < 4 { 2 } else { 1 };
+            let left = if block % 4 == 0 { 0 } else { 1 };
+            assert_eq!(
+                decoder.read_tree(&super::B_MODE_TREE, &super::KF_B_MODE_PROBS[above][left], 0),
+                1
+            );
+        }
+        assert_eq!(decoder.read_tree(&UV_MODE_TREE, &KF_UV_MODE_PROBS, 0), 0);
+        assert_eq!(writer.above, [1, 1, 1, 1, 3, 3, 3, 3]);
+        assert_eq!(writer.left, [1; 4]);
+    }
+
+    #[test]
+    fn empty_counts_keep_every_default_probability() {
+        for (default, update) in crate::residual::DEFAULT_COEFF_PROBS
+            .into_iter()
+            .zip(crate::residual::COEFF_UPDATE_PROBS)
+        {
+            for candidate in 1..=255 {
+                assert_eq!(
+                    u8::from(super::probability_update_saves_bits(
+                        [0, 0],
+                        default,
+                        candidate,
+                        update
+                    )),
+                    0
+                );
+            }
+        }
     }
 
     #[test]
