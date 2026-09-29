@@ -74,7 +74,9 @@ pub enum Alpha {
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Filter {
-    /// Signal level 0 and sharpness 0 at version 0.1.0.
+    /// Signal `min(63, quantizer index)` and sharpness 0.
+    ///
+    /// The level follows the quantizer index alone.
     #[default]
     Auto,
     /// Signal an exact level and sharpness.
@@ -90,9 +92,9 @@ pub enum Filter {
 
 /// Settings for one encode.
 ///
-/// In version 0.1.0, [`Options::default`] uses quality 75 and keeps alpha
-/// lossless. Its [`Filter::Auto`] setting signals loop filter level 0. The
-/// default writes `VP8X` only when transparency needs it or
+/// [`Options::default`] uses quality 75 and keeps alpha lossless. Its
+/// [`Filter::Auto`] setting signals level 26 and sharpness 0 at that quality.
+/// The default writes `VP8X` only when transparency needs it or
 /// [`Options::force_vp8x`] requests it.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

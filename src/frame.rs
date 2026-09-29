@@ -383,7 +383,8 @@ fn write_frame_header<W: EntropyWriter>(
 ) {
     let (level, sharpness) = match filter {
         Filter::Level { level, sharpness } => (level.min(63), sharpness.min(7)),
-        Filter::Auto | Filter::Off => (0, 0),
+        Filter::Auto => (quantizer_index.min(63), 0),
+        Filter::Off => (0, 0),
     };
 
     // RFC 6386 section 9.2 reserves color_space 0 for YUV.
@@ -1275,7 +1276,7 @@ mod tests {
     }
 
     #[test]
-    fn filter_values_saturate_and_auto_matches_off_at_version_zero_point_one() {
+    fn filter_values_saturate_at_the_header_field_limits() {
         let pixels = [128u8; 3];
         let saturated_options = Options {
             filter: Filter::Level {
@@ -1292,14 +1293,26 @@ mod tests {
         assert_eq!(header.read_literal(1), 0);
         assert_eq!(header.read_literal(6), 63);
         assert_eq!(header.read_literal(3), 7);
+    }
 
-        let auto = encode(&pixels, 1, 1, 3, 26, &Options::default()).webp;
-        let off_options = Options {
+    #[test]
+    fn the_auto_filter_signals_the_quantizer_index_capped_at_sixty_three() {
+        for index in 0..=127 {
+            let encoded = encode(&[128; 3], 1, 1, 3, index, &Options::default());
+            assert_eq!(read_filter_fields(&encoded.webp), (index.min(63), 0));
+        }
+    }
+
+    #[test]
+    fn the_off_filter_signals_level_zero_and_sharpness_zero() {
+        let options = Options {
             filter: Filter::Off,
             ..Options::default()
         };
-        let off = encode(&pixels, 1, 1, 3, 26, &off_options).webp;
-        assert_eq!(auto, off);
+        for index in 0..=127 {
+            let encoded = encode(&[128; 3], 1, 1, 3, index, &options);
+            assert_eq!(read_filter_fields(&encoded.webp), (0, 0));
+        }
     }
 
     #[test]
@@ -1594,6 +1607,77 @@ mod tests {
     }
 
     #[test]
+    fn auto_filtered_reconstruction_matches_dwebp_for_every_fixture_quality_and_index() {
+        if !oracle_is_available("dwebp") {
+            return;
+        }
+        let directory = scratch_directory(
+            "auto_filtered_reconstruction_matches_dwebp_for_every_fixture_quality_and_index",
+        );
+        let fixtures = generator::all();
+        for fixture in &fixtures {
+            for quality in [0u8, 25, 50, 75, 90, 95, 100] {
+                assert_reconstruction_with_filter(
+                    &directory,
+                    fixture,
+                    quantizer_index(quality),
+                    Filter::Auto,
+                );
+            }
+        }
+        for name in ["gradient", "noise", "diagonals"] {
+            let fixture = fixtures
+                .iter()
+                .find(|fixture| fixture.name == name)
+                .expect("find the indexed fixture");
+            for index in 0..=127 {
+                assert_reconstruction_with_filter(&directory, fixture, index, Filter::Auto);
+            }
+        }
+        fs::remove_dir_all(directory).expect("remove the test directory");
+    }
+
+    #[test]
+    fn explicit_filter_levels_and_sharpness_match_dwebp_on_lowpass_noise() {
+        if !oracle_is_available("dwebp") {
+            return;
+        }
+        let directory =
+            scratch_directory("explicit_filter_levels_and_sharpness_match_dwebp_on_lowpass_noise");
+        let fixtures = generator::all();
+        let fixture = fixtures
+            .iter()
+            .find(|fixture| fixture.name == "lowpass-noise")
+            .expect("find the lowpass fixture");
+        for (level, sharpness) in (0..=63)
+            .map(|level| (level, 0))
+            .chain((0..=7).map(|sharpness| (30, sharpness)))
+        {
+            let options = Options {
+                quality: 50,
+                filter: Filter::Level { level, sharpness },
+                ..Options::default()
+            };
+            let encoded = encode(
+                &fixture.rgba,
+                fixture.width as usize,
+                fixture.height as usize,
+                4,
+                quantizer_index(50),
+                &options,
+            );
+            assert_eq!(read_filter_fields(&encoded.webp), (level, sharpness));
+            assert_eq!(
+                encoded.webp,
+                crate::encode_rgba(&fixture.rgba, fixture.width, fixture.height, &options)
+                    .expect("encode the filtered fixture")
+            );
+            assert_encoded_reconstruction(&directory, fixture, quantizer_index(50), &encoded);
+        }
+        fs::remove_dir_all(directory).expect("remove the test directory");
+    }
+
+    #[test]
     fn every_swept_dimension_decodes_and_matches_reconstruction_and_boundary_sides_return_errors() {
         let oracle_available = oracle_is_available("dwebp");
         let directory = scratch_directory(
@@ -1871,10 +1955,15 @@ mod tests {
     type FrameRecords = (Vec<(u8, u8, [u8; 16])>, Vec<bool>, [u8; 1056]);
 
     fn read_frame_records(webp: &[u8], columns: usize, rows: usize) -> FrameRecords {
-        let mut decoder = crate::bool_coder::BoolDecoder::new(&webp[30..]);
-        for width in [1, 1, 1, 1, 6, 3, 1, 2] {
-            assert_eq!(decoder.read_literal(width), 0);
+        let payload = vp8_payload(webp);
+        let mut decoder = crate::bool_coder::BoolDecoder::new(&payload[10..]);
+        for _ in 0..4 {
+            assert_eq!(decoder.read_literal(1), 0);
         }
+        decoder.read_literal(6);
+        decoder.read_literal(3);
+        assert_eq!(decoder.read_literal(1), 0);
+        assert_eq!(decoder.read_literal(2), 0);
         decoder.read_literal(7);
         assert_eq!(read_deltas(&mut decoder), [0, 0, 0, -2, -4]);
         assert_eq!(decoder.read_literal(1), 1);
@@ -1942,6 +2031,7 @@ mod tests {
     ) {
         let options = Options {
             quality,
+            filter: Filter::Off,
             ..Options::default()
         };
         let rgb = rgb_bytes(&fixture.rgba);
@@ -2071,8 +2161,17 @@ mod tests {
     }
 
     fn assert_reconstruction(directory: &Path, fixture: &generator::Fixture, index: u8) {
+        assert_reconstruction_with_filter(directory, fixture, index, Filter::Off);
+    }
+
+    fn assert_reconstruction_with_filter(
+        directory: &Path,
+        fixture: &generator::Fixture,
+        index: u8,
+        filter: Filter,
+    ) {
         let options = Options {
-            filter: Filter::Off,
+            filter,
             ..Options::default()
         };
         let encoded = encode(
@@ -2083,6 +2182,12 @@ mod tests {
             index,
             &options,
         );
+        let expected = match filter {
+            Filter::Auto => (index.min(63), 0),
+            Filter::Off => (0, 0),
+            Filter::Level { level, sharpness } => (level.min(63), sharpness.min(7)),
+        };
+        assert_eq!(read_filter_fields(&encoded.webp), expected);
         assert_encoded_reconstruction(directory, fixture, index, &encoded);
     }
 
@@ -2136,31 +2241,54 @@ mod tests {
         let height = fixture.height as usize;
         let chroma_width = (fixture.width as usize).div_ceil(2);
         let chroma_height = (fixture.height as usize).div_ceil(2);
+        let (level, sharpness) = read_filter_fields(&encoded.webp);
+        let columns = width.div_ceil(16);
+        let rows = height.div_ceil(16);
+        let (modes, skips, _) = read_frame_records(&encoded.webp, columns, rows);
+        let macroblocks: Vec<_> = modes
+            .iter()
+            .zip(skips)
+            .map(|(mode, skip)| crate::loop_filter::Macroblock {
+                skip,
+                b_pred: mode.0 == 4,
+            })
+            .collect();
+        let mut y = encoded.reconstruction.y.clone();
+        let mut u = encoded.reconstruction.u.clone();
+        let mut v = encoded.reconstruction.v.clone();
+        crate::loop_filter::filter_frame(
+            [&mut y, &mut u, &mut v],
+            columns,
+            rows,
+            level,
+            sharpness,
+            &macroblocks,
+        );
         let y_length = width * height;
         let chroma_length = chroma_width * chroma_height;
         assert_plane_matches(
             fixture,
-            index,
+            (index, level, sharpness),
             "Y",
-            &encoded.reconstruction.y,
+            &y,
             encoded.reconstruction.y_stride,
             &decoded[..y_length],
             (width, height),
         );
         assert_plane_matches(
             fixture,
-            index,
+            (index, level, sharpness),
             "U",
-            &encoded.reconstruction.u,
+            &u,
             encoded.reconstruction.chroma_stride,
             &decoded[y_length..y_length + chroma_length],
             (chroma_width, chroma_height),
         );
         assert_plane_matches(
             fixture,
-            index,
+            (index, level, sharpness),
             "V",
-            &encoded.reconstruction.v,
+            &v,
             encoded.reconstruction.chroma_stride,
             &decoded[y_length + chroma_length..y_length + 2 * chroma_length],
             (chroma_width, chroma_height),
@@ -2169,7 +2297,7 @@ mod tests {
             let alpha = alpha_bytes(&fixture.rgba);
             assert_plane_matches(
                 fixture,
-                index,
+                (index, level, sharpness),
                 "A",
                 &alpha,
                 width,
@@ -2181,7 +2309,7 @@ mod tests {
 
     fn assert_plane_matches(
         fixture: &generator::Fixture,
-        index: u8,
+        controls: (u8, u8, u8),
         plane: &str,
         reconstruction: &[u8],
         reconstruction_stride: usize,
@@ -2189,17 +2317,27 @@ mod tests {
         dimensions: (usize, usize),
     ) {
         let (width, height) = dimensions;
+        let (index, level, sharpness) = controls;
         for row in 0..height {
             for column in 0..width {
                 let decoded_value = decoded[row * width + column];
                 let reconstruction_value = reconstruction[row * reconstruction_stride + column];
                 assert_eq!(
                     decoded_value, reconstruction_value,
-                    "fixture {}, quantizer index {index}, plane {plane}, first differing row {row}, column {column}",
+                    "fixture {}, quantizer index {index}, level {level}, sharpness {sharpness}, plane {plane}, first differing row {row}, column {column}",
                     fixture.name
                 );
             }
         }
+    }
+
+    fn read_filter_fields(webp: &[u8]) -> (u8, u8) {
+        let payload = vp8_payload(webp);
+        let mut decoder = crate::bool_coder::BoolDecoder::new(&payload[10..]);
+        for _ in 0..4 {
+            assert_eq!(decoder.read_literal(1), 0);
+        }
+        (decoder.read_literal(6) as u8, decoder.read_literal(3) as u8)
     }
 
     fn read_quantizer_index(webp: &[u8]) -> u8 {
@@ -2434,7 +2572,10 @@ mod tests {
                 fixture.height as usize,
                 4,
                 quantizer_index(75),
-                &Options::default(),
+                &Options {
+                    filter: Filter::Off,
+                    ..Options::default()
+                },
                 decision,
             );
             assert_eq!(usize::from(encoded.rung), rung);
