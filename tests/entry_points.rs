@@ -1,5 +1,7 @@
 //! What the two entry points return for well-formed and malformed calls.
 
+#![forbid(unsafe_code)]
+
 use tiny_webp::{encode_rgb, encode_rgba, Error, Options};
 
 /// Builds options at a quality the way a caller outside the crate builds them.

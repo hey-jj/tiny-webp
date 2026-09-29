@@ -21,13 +21,14 @@ pub struct Fixture {
 
 /// Builds the whole fixture table.
 ///
-/// The table covers a gradient, a hard-edged shape, a noise field, a low-pass
-/// noise field, a soft alpha mask, a hard alpha mask, and the sizes 1x1, 1x33,
-/// 33x1, and 17x31.
+/// Includes `flat`, `checker`, `diagonals`, `gradient`, `text-blocks`,
+/// `noise`, `lowpass-noise`, `alpha-soft`, `alpha-hard`, `alpha-odd`,
+/// `photo-large`, `one-pixel`, `single-column`, `single-row`, and `odd-size`.
 pub fn all() -> Vec<Fixture> {
     vec![
         flat("flat", 32, 32),
         checker("checker", 32, 32),
+        diagonals(),
         gradient("gradient", 64, 48),
         text_blocks("text-blocks", 64, 48),
         noise("noise", 64, 48),
@@ -70,6 +71,31 @@ fn checker(name: &'static str, width: u32, height: u32) -> Fixture {
         name,
         width,
         height,
+        rgba,
+    }
+}
+
+/// Four opaque regions with edges at slopes 1, -1, 1/2, and -1/2.
+fn diagonals() -> Fixture {
+    let mut rgba = Vec::with_capacity(48 * 48 * 4);
+    for y in 0..48 {
+        for x in 0..48 {
+            let local_x = x % 24;
+            let local_y = y % 24;
+            let bright = match (x / 24, y / 24) {
+                (0, 0) => local_y >= local_x,
+                (1, 0) => local_y + local_x >= 23,
+                (0, 1) => 2 * local_y >= local_x + 12,
+                _ => 2 * local_y + local_x >= 35,
+            };
+            let value = if bright { 240 } else { 24 };
+            rgba.extend_from_slice(&[value, value, value, 255]);
+        }
+    }
+    Fixture {
+        name: "diagonals",
+        width: 48,
+        height: 48,
         rgba,
     }
 }

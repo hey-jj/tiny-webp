@@ -7,7 +7,7 @@ pub(crate) fn predict_luma_dc(
     macroblock_x: usize,
     macroblock_y: usize,
 ) -> [u8; LUMA_SIDE * LUMA_SIDE] {
-    [dc_value::<LUMA_SIDE, 4, 5>(reconstruction, stride, macroblock_x, macroblock_y);
+    [dc_value::<LUMA_SIDE>(reconstruction, stride, macroblock_x, macroblock_y);
         LUMA_SIDE * LUMA_SIDE]
 }
 
@@ -17,11 +17,11 @@ pub(crate) fn predict_chroma_dc(
     macroblock_x: usize,
     macroblock_y: usize,
 ) -> [u8; CHROMA_SIDE * CHROMA_SIDE] {
-    [dc_value::<CHROMA_SIDE, 3, 4>(reconstruction, stride, macroblock_x, macroblock_y);
+    [dc_value::<CHROMA_SIDE>(reconstruction, stride, macroblock_x, macroblock_y);
         CHROMA_SIDE * CHROMA_SIDE]
 }
 
-fn dc_value<const SIDE: usize, const EDGE_SHIFT: u32, const BOTH_SHIFT: u32>(
+fn dc_value<const SIDE: usize>(
     reconstruction: &[u8],
     stride: usize,
     macroblock_x: usize,
@@ -50,9 +50,9 @@ fn dc_value<const SIDE: usize, const EDGE_SHIFT: u32, const BOTH_SHIFT: u32>(
     }
 
     let shift = if macroblock_x > 0 && macroblock_y > 0 {
-        BOTH_SHIFT
+        SIDE.ilog2() + 1
     } else {
-        EDGE_SHIFT
+        SIDE.ilog2()
     };
     ((sum + (1 << (shift - 1))) >> shift) as u8
 }

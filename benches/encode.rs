@@ -1,5 +1,7 @@
 //! Times `photo-large` at quality 75.
 
+#![forbid(unsafe_code)]
+
 #[path = "../fixtures/generator.rs"]
 mod generator;
 

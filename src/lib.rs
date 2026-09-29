@@ -40,7 +40,7 @@ mod generator;
 #[cfg(test)]
 #[path = "../fixtures/png_writer.rs"]
 mod png_writer;
-pub(crate) mod prediction;
+mod prediction;
 mod quantize;
 mod residual;
 mod transform;

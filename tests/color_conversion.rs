@@ -1,5 +1,7 @@
 //! The checked-in BT.601 constants follow their real-valued definitions.
 
+#![forbid(unsafe_code)]
+
 extern crate alloc;
 
 #[path = "../src/color.rs"]
@@ -26,7 +28,10 @@ fn the_fixed_point_color_coefficients_regenerate_from_bt_601() {
     ];
     let generated = real_coefficients.map(|value| (value * 65536.0).round() as i32);
     assert_eq!(generated, color::BT601_COEFFICIENTS);
+}
 
+#[test]
+fn a_single_pixel_uses_one_macroblock_stride_for_each_plane() {
     let planes = color::convert(&[0, 0, 0], 1, 1, 3);
     assert_eq!((planes.y_stride, planes.chroma_stride), (16, 8));
 }

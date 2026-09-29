@@ -1,5 +1,7 @@
 //! The settings a caller gets before changing anything.
 
+#![forbid(unsafe_code)]
+
 use tiny_webp::{Alpha, Filter, Options};
 
 #[test]

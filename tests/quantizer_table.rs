@@ -1,5 +1,7 @@
 //! The checked-in quality table regenerates from its formula.
 
+#![forbid(unsafe_code)]
+
 #[path = "../src/quantize.rs"]
 mod quantize;
 

@@ -1,5 +1,9 @@
 //! Measures encoder speed, peak heap growth, output size, and RGB PSNR.
 
+// The std::alloc::GlobalAlloc contract requires unsafe allocator methods.
+// This counting allocator is the crate root exception.
+#![deny(unsafe_op_in_unsafe_fn)]
+
 #[path = "../fixtures/generator.rs"]
 mod generator;
 #[path = "../fixtures/png_writer.rs"]
@@ -24,9 +28,11 @@ static PEAK_HEAP_BYTES: AtomicUsize = AtomicUsize::new(0);
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
 
+// The std::alloc::GlobalAlloc contract forbids unwinding in allocator methods.
+// These methods forward valid arguments to System and count bytes with atomics.
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // GlobalAlloc requires callers to supply a valid layout.
+        // std::alloc::GlobalAlloc requires a nonzero layout with valid alignment.
         let pointer = unsafe { System.alloc(layout) };
         if !pointer.is_null() {
             record_growth(layout.size());
@@ -35,7 +41,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        // GlobalAlloc requires callers to supply a valid layout.
+        // std::alloc::GlobalAlloc requires a nonzero layout with valid alignment.
         let pointer = unsafe { System.alloc_zeroed(layout) };
         if !pointer.is_null() {
             record_growth(layout.size());
@@ -44,13 +50,15 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
 
     unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
-        // GlobalAlloc returns this allocator's pointers to dealloc.
+        // std::alloc::GlobalAlloc requires this pointer and layout to match an allocation.
+        // Every allocation here comes from System.
         unsafe { System.dealloc(pointer, layout) };
         record_shrink(layout.size());
     }
 
     unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        // GlobalAlloc returns this allocator's pointers to realloc.
+        // std::alloc::GlobalAlloc requires a live allocation and a valid new size.
+        // System owns each pointer and receives its unchanged layout.
         let new_pointer = unsafe { System.realloc(pointer, layout, new_size) };
         if !new_pointer.is_null() {
             if new_size >= layout.size() {

@@ -1,5 +1,8 @@
 //! The command line input, output, and exit contracts.
 
+#![forbid(unsafe_code)]
+#![cfg(feature = "cli")]
+
 #[path = "../fixtures/generator.rs"]
 mod generator;
 #[path = "../fixtures/png_writer.rs"]
@@ -309,7 +312,8 @@ fn non_utf8_dash_prefixed_paths_keep_their_bytes_in_value_positions() {
 
 #[test]
 fn repeated_flags_take_their_last_value_or_keep_their_first_effect() {
-    let directory = scratch_directory("repeated_flags");
+    let directory =
+        scratch_directory("repeated_flags_take_their_last_value_or_keep_their_first_effect");
     let fixture = generator::all()
         .into_iter()
         .find(|fixture| fixture.name == "alpha-odd")
@@ -342,7 +346,7 @@ fn repeated_flags_take_their_last_value_or_keep_their_first_effect() {
     ]);
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(u8::from(first.exists()), 0);
-    assert_eq!(u8::from(second.exists()), 1);
+    assert!(second.exists(), "the final output file is missing");
 
     let one_word = directory.join("one-word.webp");
     let repeated_word = directory.join("repeated-word.webp");
@@ -367,7 +371,9 @@ fn repeated_flags_take_their_last_value_or_keep_their_first_effect() {
 
 #[test]
 fn png_and_lossless_webp_inputs_match_the_library_for_every_fixture_and_flag_row() {
-    let directory = scratch_directory("input_formats_match_library");
+    let directory = scratch_directory(
+        "png_and_lossless_webp_inputs_match_the_library_for_every_fixture_and_flag_row",
+    );
     for fixture in generator::all() {
         for (extension, bytes) in [
             ("png", png_bytes(&fixture)),
@@ -402,7 +408,8 @@ fn png_and_lossless_webp_inputs_match_the_library_for_every_fixture_and_flag_row
 
 #[test]
 fn baseline_jpeg_inputs_match_their_decoded_pixels_at_every_flag_row() {
-    let directory = scratch_directory("jpeg_matches_library");
+    let directory =
+        scratch_directory("baseline_jpeg_inputs_match_their_decoded_pixels_at_every_flag_row");
     let input = directory.join("constant.data");
     let jpeg = baseline_jpeg(1);
     std::fs::write(&input, &jpeg).expect("write the JPEG input");
@@ -443,7 +450,8 @@ fn baseline_jpeg_inputs_match_their_decoded_pixels_at_every_flag_row() {
 
 #[test]
 fn grayscale_png_inputs_expand_to_their_rgb_and_rgba_library_bytes() {
-    let directory = scratch_directory("grayscale_png");
+    let directory =
+        scratch_directory("grayscale_png_inputs_expand_to_their_rgb_and_rgba_library_bytes");
     let gray_input = directory.join("gray.png");
     let gray_output = directory.join("gray.webp");
     std::fs::write(
@@ -487,7 +495,8 @@ fn grayscale_png_inputs_expand_to_their_rgb_and_rgba_library_bytes() {
 
 #[test]
 fn unreadable_and_unsupported_inputs_exit_one_with_one_exact_problem_line() {
-    let directory = scratch_directory("input_problems");
+    let directory =
+        scratch_directory("unreadable_and_unsupported_inputs_exit_one_with_one_exact_problem_line");
     let output_path = directory.join("output.webp");
     let missing = directory.join("missing.png");
     let missing_output = run_file(&missing, &output_path, &[]);
@@ -561,7 +570,8 @@ fn unreadable_and_unsupported_inputs_exit_one_with_one_exact_problem_line() {
 
 #[test]
 fn an_oversized_decoded_image_exits_one_with_one_exact_problem_line() {
-    let directory = scratch_directory("oversized_image");
+    let directory =
+        scratch_directory("an_oversized_decoded_image_exits_one_with_one_exact_problem_line");
     let input = directory.join("wide.png");
     let output_path = directory.join("output.webp");
     let pixels = vec![0; 16_384 * 3];
@@ -585,7 +595,7 @@ fn an_oversized_decoded_image_exits_one_with_one_exact_problem_line() {
 
 #[test]
 fn quiet_success_writes_neither_stream_for_a_file_output() {
-    let directory = scratch_directory("quiet_success");
+    let directory = scratch_directory("quiet_success_writes_neither_stream_for_a_file_output");
     let fixture = generator::all().remove(0);
     let input = directory.join("input.png");
     let output_path = directory.join("output.webp");
@@ -594,13 +604,13 @@ fn quiet_success_writes_neither_stream_for_a_file_output() {
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(output.stdout, b"");
     assert_eq!(output.stderr, b"");
-    assert_eq!(u8::from(output_path.exists()), 1);
+    assert!(output_path.exists(), "the output file is missing");
     std::fs::remove_dir_all(directory).expect("remove the test directory");
 }
 
 #[test]
 fn stdin_and_stdout_write_the_same_bytes_as_file_paths() {
-    let directory = scratch_directory("standard_streams");
+    let directory = scratch_directory("stdin_and_stdout_write_the_same_bytes_as_file_paths");
     let fixture = generator::all().remove(0);
     let png = png_bytes(&fixture);
     let input = directory.join("input.png");
@@ -621,7 +631,7 @@ fn stdin_and_stdout_write_the_same_bytes_as_file_paths() {
 #[cfg(unix)]
 #[test]
 fn an_unreadable_stdin_exits_one_with_its_exact_problem_line() {
-    let directory = scratch_directory("stdin_problem");
+    let directory = scratch_directory("an_unreadable_stdin_exits_one_with_its_exact_problem_line");
     let output_path = directory.join("output.webp");
     let stdin = std::fs::File::open(&directory).expect("open the test directory");
     let output = command()
@@ -748,7 +758,7 @@ fn diagnostics_and_summaries_escape_control_characters_in_paths() {
 
 #[test]
 fn summary_and_verbose_success_lines_match_their_exact_shapes() {
-    let directory = scratch_directory("success_lines");
+    let directory = scratch_directory("summary_and_verbose_success_lines_match_their_exact_shapes");
     let fixture = generator::all().remove(0);
     let input = directory.join("input.png");
     let output_path = directory.join("output.webp");
@@ -772,26 +782,29 @@ fn summary_and_verbose_success_lines_match_their_exact_shapes() {
     let prefix = format!("tiny-webp: 32x32, {byte_count} bytes, ");
     assert_eq!(verbose.status.code(), Some(0));
     assert_eq!(verbose.stdout, b"");
-    assert_eq!(u8::from(line.starts_with(&prefix)), 1);
-    assert_eq!(u8::from(line.ends_with(" ms\n")), 1);
+    assert!(
+        line.starts_with(&prefix),
+        "the dimensions and byte count must match"
+    );
+    assert!(line.ends_with(" ms\n"), "the time must end in milliseconds");
     let time = &line[prefix.len()..line.len() - 4];
     let parts: Vec<&str> = time.split('.').collect();
     assert_eq!(parts.len(), 2);
-    assert_eq!(
-        u8::from(parts[0].chars().all(|value| value.is_ascii_digit())),
-        1
+    assert!(
+        parts[0].chars().all(|value| value.is_ascii_digit()),
+        "milliseconds must contain digits"
     );
     assert_eq!(parts[1].len(), 3);
-    assert_eq!(
-        u8::from(parts[1].chars().all(|value| value.is_ascii_digit())),
-        1
+    assert!(
+        parts[1].chars().all(|value| value.is_ascii_digit()),
+        "microseconds must contain digits"
     );
     std::fs::remove_dir_all(directory).expect("remove the test directory");
 }
 
 #[test]
 fn an_unwritable_output_exits_one_with_one_exact_problem_line() {
-    let directory = scratch_directory("output_problem");
+    let directory = scratch_directory("an_unwritable_output_exits_one_with_one_exact_problem_line");
     let fixture = generator::all().remove(0);
     let input = directory.join("input.png");
     std::fs::write(&input, png_bytes(&fixture)).expect("write the PNG input");
@@ -813,7 +826,9 @@ fn an_unwritable_output_exits_one_with_one_exact_problem_line() {
 fn a_non_utf8_input_path_reaches_the_same_rewrite_and_names_the_path_lossily() {
     use std::os::unix::ffi::OsStringExt;
 
-    let directory = scratch_directory("non_utf8_path");
+    let directory = scratch_directory(
+        "a_non_utf8_input_path_reaches_the_same_rewrite_and_names_the_path_lossily",
+    );
     let mut bytes = directory.as_os_str().as_encoded_bytes().to_vec();
     bytes.push(b'/');
     bytes.extend_from_slice(b"image-");

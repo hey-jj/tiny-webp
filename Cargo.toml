@@ -40,6 +40,8 @@ jpeg-decoder = { version = "0.3", optional = true, default-features = false, fea
 image-webp = { version = "0.2.4", optional = true }
 
 [dev-dependencies]
+png = "0.18"
+jpeg-decoder = { version = "0.3", default-features = false, features = ["platform_independent"] }
 criterion = "0.7"
 image-webp = "0.2.4"
 sha2 = "0.10"
@@ -47,10 +49,6 @@ sha2 = "0.10"
 [[bin]]
 name = "tiny-webp"
 path = "src/bin/tiny-webp.rs"
-required-features = ["cli"]
-
-[[example]]
-name = "bench"
 required-features = ["cli"]
 
 [[bench]]

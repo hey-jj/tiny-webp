@@ -121,23 +121,41 @@ fn write_frame_header(encoder: &mut BoolEncoder, quantizer_index: u8, filter: Fi
         Filter::Auto | Filter::Off => (0, 0),
     };
 
-    // RFC 6386 sections 9 and 19.2 fix this field order.
+    // RFC 6386 section 9.2 reserves color_space 0 for YUV.
     encoder.write_literal(0, 1);
+    // RFC 6386 section 9.2 requires decoder saturation with clamping_type 0.
     encoder.write_literal(0, 1);
+    // RFC 6386 section 9.3 applies one quantizer when segmentation_enabled is 0.
     encoder.write_literal(0, 1);
+    // RFC 6386 sections 9.4 and 15 define the normal filter selected by filter_type.
     encoder.write_literal(0, 1);
+    // RFC 6386 section 9.4 limits loop_filter_level to six bits.
     encoder.write_literal(u32::from(level), 6);
+    // RFC 6386 section 9.4 limits sharpness_level to three bits.
     encoder.write_literal(u32::from(sharpness), 3);
+    // RFC 6386 section 9.4 keeps the frame level when loop_filter_adj_enable is 0.
     encoder.write_literal(0, 1);
+    // RFC 6386 section 9.5 uses log2_nbr_of_dct_partitions 0 for one token partition.
     encoder.write_literal(0, 2);
+    // RFC 6386 section 9.6 uses y_ac_qi as the base index for every plane.
     encoder.write_literal(u32::from(quantizer_index), 7);
-    for _ in 0..5 {
-        encoder.write_literal(0, 1);
-    }
+    // RFC 6386 section 9.6 keeps the base Y DC index with y_dc_delta_present 0.
+    encoder.write_literal(0, 1);
+    // RFC 6386 section 9.6 keeps the base Y2 DC index with y2_dc_delta_present 0.
+    encoder.write_literal(0, 1);
+    // RFC 6386 section 9.6 keeps the base Y2 AC index with y2_ac_delta_present 0.
+    encoder.write_literal(0, 1);
+    // RFC 6386 section 9.6 keeps the base chroma DC index with uv_dc_delta_present 0.
+    encoder.write_literal(0, 1);
+    // RFC 6386 section 9.6 keeps the base chroma AC index with uv_ac_delta_present 0.
+    encoder.write_literal(0, 1);
+    // RFC 6386 section 19.2 retains token probabilities with refresh_entropy_probs 1.
     encoder.write_literal(1, 1);
+    // RFC 6386 section 13.4 retains each default with token_prob_update 0.
     for probability in COEFF_UPDATE_PROBS {
         encoder.write_bool(probability, false);
     }
+    // RFC 6386 section 9.11 requires every residual when mb_no_skip_coeff is 0.
     encoder.write_literal(0, 1);
 }
 
@@ -635,7 +653,9 @@ mod tests {
                 let channels = if has_alpha { 4 } else { 3 };
                 let mut pixels =
                     vec![0; fixture.width as usize * fixture.height as usize * channels];
-                assert_eq!(u8::from(decoder.read_image(&mut pixels).is_ok()), 1);
+                decoder
+                    .read_image(&mut pixels)
+                    .expect("decode the fixture pixels");
                 if has_alpha {
                     assert_eq!(
                         alpha_bytes(&pixels),
@@ -708,7 +728,8 @@ mod tests {
         if !oracle_is_available("dwebp") {
             return;
         }
-        let directory = scratch_directory("dwebp_preserves_alpha");
+        let directory =
+            scratch_directory("dwebp_yuv_output_ends_with_each_input_alpha_plane_at_each_quality");
         let input = directory.join("input.webp");
         let output = directory.join("output.yuv");
         for fixture in generator::all()
@@ -733,7 +754,7 @@ mod tests {
                     .arg(&output)
                     .status()
                     .expect("run dwebp");
-                assert_eq!(u8::from(status.success()), 1, "{} q{quality}", fixture.name);
+                assert!(status.success(), "{} q{quality}", fixture.name);
                 let decoded = fs::read(&output).expect("read the decoded YUV planes");
                 let chroma_pixels =
                     fixture.width.div_ceil(2) as usize * fixture.height.div_ceil(2) as usize;
@@ -756,7 +777,8 @@ mod tests {
         if !oracle_is_available("dwebp") {
             return;
         }
-        let directory = scratch_directory("dwebp_decodes_every_fixture");
+        let directory =
+            scratch_directory("dwebp_decodes_every_fixture_at_its_dimensions_at_each_quality");
         let input = directory.join("input.webp");
         let output = directory.join("output.png");
         for fixture in generator::all() {
@@ -776,7 +798,7 @@ mod tests {
                     .arg(&output)
                     .status()
                     .expect("run dwebp");
-                assert_eq!(u8::from(status.success()), 1, "{} q{quality}", fixture.name);
+                assert!(status.success(), "{} q{quality}", fixture.name);
                 assert_eq!(png_dimensions(&output), (fixture.width, fixture.height));
             }
         }
@@ -788,13 +810,14 @@ mod tests {
         if !oracle_is_available("dwebp") {
             return;
         }
-        let directory = scratch_directory("reconstruction_matches_dwebp");
+        let directory =
+            scratch_directory("reconstruction_matches_dwebp_for_every_fixture_quality_and_index");
         for fixture in generator::all() {
             for quality in [0u8, 25, 50, 75, 90, 95, 100] {
                 assert_reconstruction(&directory, &fixture, quantizer_index(quality));
             }
         }
-        for name in ["gradient", "noise"] {
+        for name in ["gradient", "noise", "diagonals"] {
             let fixtures = generator::all();
             let fixture = fixtures
                 .iter()
@@ -855,19 +878,12 @@ mod tests {
     }
 
     #[test]
-    fn a_reconstruction_difference_names_its_fixture_index_plane_row_and_column() {
-        assert_eq!(
-            reconstruction_difference_message("flat", 26, "U", 3, 7),
-            "fixture flat, quantizer index 26, plane U, first differing row 3, column 7"
-        );
-    }
-
-    #[test]
     fn cwebp_writes_each_checked_in_quality_index_into_its_frame_header() {
         if !oracle_is_available("cwebp") {
             return;
         }
-        let directory = scratch_directory("cwebp_quality_indices");
+        let directory =
+            scratch_directory("cwebp_writes_each_checked_in_quality_index_into_its_frame_header");
         let fixtures = generator::all();
         let fixture = fixtures
             .iter()
@@ -890,7 +906,7 @@ mod tests {
                 .arg(&output)
                 .status()
                 .expect("run cwebp");
-            assert_eq!(u8::from(status.success()), 1, "quality {quality}");
+            assert!(status.success(), "quality {quality}");
             let webp = fs::read(&output).expect("read the cwebp output");
             assert_eq!(read_quantizer_index(&webp), *expected);
         }
@@ -968,13 +984,9 @@ mod tests {
             fixture.height
         );
         let mut pixels = vec![0; fixture.width as usize * fixture.height as usize * 3];
-        assert_eq!(
-            u8::from(decoder.read_image(&mut pixels).is_ok()),
-            1,
-            "{entry} {}x{} q{quality}",
-            fixture.width,
-            fixture.height
-        );
+        decoder
+            .read_image(&mut pixels)
+            .expect("decode the dimension case pixels");
     }
 
     fn assert_reconstruction_for_pixels(
@@ -1084,9 +1096,8 @@ mod tests {
             .arg(&output)
             .status()
             .expect("run dwebp");
-        assert_eq!(
-            u8::from(status.success()),
-            1,
+        assert!(
+            status.success(),
             "fixture {}, quantizer index {index}",
             fixture.name
         );
@@ -1152,25 +1163,13 @@ mod tests {
             for column in 0..width {
                 let decoded_value = decoded[row * width + column];
                 let reconstruction_value = reconstruction[row * reconstruction_stride + column];
-                if decoded_value != reconstruction_value {
-                    let message =
-                        reconstruction_difference_message(fixture.name, index, plane, row, column);
-                    assert_eq!(decoded_value, reconstruction_value, "{message}");
-                }
+                assert_eq!(
+                    decoded_value, reconstruction_value,
+                    "fixture {}, quantizer index {index}, plane {plane}, first differing row {row}, column {column}",
+                    fixture.name
+                );
             }
         }
-    }
-
-    fn reconstruction_difference_message(
-        fixture: &str,
-        index: u8,
-        plane: &str,
-        row: usize,
-        column: usize,
-    ) -> std::string::String {
-        format!(
-            "fixture {fixture}, quantizer index {index}, plane {plane}, first differing row {row}, column {column}"
-        )
     }
 
     fn read_quantizer_index(webp: &[u8]) -> u8 {

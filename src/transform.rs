@@ -110,7 +110,7 @@ pub(crate) fn forward_wht(input: &[i32; 16]) -> [i32; 16] {
             intermediate[offset + 3],
         ]);
         for column in 0..4 {
-            output[offset + column] = divide_by_two(transformed[column]);
+            output[offset + column] = rounded_shift(i64::from(transformed[column]), 1);
         }
     }
 
@@ -148,14 +148,6 @@ fn wht_pass(values: [i32; 4]) -> [i32; 4] {
     let c = values[1] - values[2];
     let d = values[0] - values[3];
     [a + b, c + d, a - b, d - c]
-}
-
-fn divide_by_two(value: i32) -> i32 {
-    if value < 0 {
-        -((-value + 1) >> 1)
-    } else {
-        (value + 1) >> 1
-    }
 }
 
 fn rounded_shift(value: i64, bits: u32) -> i32 {

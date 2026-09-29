@@ -70,18 +70,13 @@ impl BoolEncoder {
     }
 
     pub(crate) fn finish(mut self) -> Vec<u8> {
-        let mut remaining = self.bit_count;
+        let remaining = self.bit_count;
         let mut value = self.bottom;
 
         if value & (1 << (32 - remaining)) != 0 {
             self.propagate_carry();
         }
-        value <<= remaining & 7;
-        remaining >>= 3;
-        while remaining > 0 {
-            value <<= 8;
-            remaining -= 1;
-        }
+        value <<= remaining;
         for _ in 0..4 {
             self.output.push((value >> 24) as u8);
             value <<= 8;
@@ -382,7 +377,7 @@ mod tests {
                     decoder.read_tree(&UV_MODE_TREE, &KF_UV_MODE_PROBS, 0) == value
                 }
             };
-            assert_eq!(u8::from(matches), 1);
+            assert!(matches, "the decoded operation differs");
         }
     }
 }

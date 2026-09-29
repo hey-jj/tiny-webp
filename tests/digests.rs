@@ -1,5 +1,7 @@
 //! The committed digest manifest matches every fixture encode.
 
+#![forbid(unsafe_code)]
+
 #[path = "../examples/digests.rs"]
 mod digests;
 
@@ -46,6 +48,7 @@ fn the_digest_manifest_contains_each_fixed_encode_in_sorted_order() {
         "alpha-odd",
         "alpha-soft",
         "checker",
+        "diagonals",
         "flat",
         "gradient",
         "lowpass-noise",
@@ -69,7 +72,7 @@ fn the_digest_manifest_contains_each_fixed_encode_in_sorted_order() {
     }
     expected.sort_unstable();
 
-    assert_eq!(actual.len(), 2668);
+    assert_eq!(actual.len(), 2872);
     assert_eq!(actual, expected);
 }
 

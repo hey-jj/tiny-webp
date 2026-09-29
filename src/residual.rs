@@ -371,7 +371,7 @@ fn token_for_magnitude(magnitude: u16) -> u8 {
         19..=34 => TOKEN_CATEGORY_FOUR,
         35..=66 => TOKEN_CATEGORY_FIVE,
         67..=2114 => TOKEN_CATEGORY_SIX,
-        _ => unreachable!("quantized levels stop at 2047"),
+        _ => unreachable!("the tokenizer saturates magnitudes at 2114"),
     }
 }
 
@@ -829,9 +829,9 @@ mod tests {
         levels[0] = i16::MAX;
         levels[1] = i16::MIN;
         let mut encoder = BoolEncoder::new();
-        assert_eq!(
-            u8::from(write_block(&mut encoder, &levels, PLANE_CHROMA, 0, 0)),
-            1
+        assert!(
+            write_block(&mut encoder, &levels, PLANE_CHROMA, 0, 0),
+            "the saturated block must contain coefficients"
         );
         let encoded = encoder.finish();
         let mut decoder = BoolDecoder::new(&encoded);

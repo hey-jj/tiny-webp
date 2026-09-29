@@ -1,5 +1,7 @@
 //! The generator gives the same bytes on every run.
 
+#![forbid(unsafe_code)]
+
 #[path = "../fixtures/generator.rs"]
 mod generator;
 #[path = "../fixtures/png_writer.rs"]
@@ -36,7 +38,7 @@ fn every_fixture_holds_four_bytes_for_each_of_its_pixels() {
 }
 
 #[test]
-fn the_fixture_table_contains_the_four_milestone_one_images() {
+fn the_fixture_table_pins_every_name_and_dimension() {
     let fixtures = generator::all();
     let table: Vec<(&str, u32, u32)> = fixtures
         .iter()
@@ -47,6 +49,7 @@ fn the_fixture_table_contains_the_four_milestone_one_images() {
         vec![
             ("flat", 32, 32),
             ("checker", 32, 32),
+            ("diagonals", 48, 48),
             ("gradient", 64, 48),
             ("text-blocks", 64, 48),
             ("noise", 64, 48),
@@ -87,8 +90,10 @@ fn the_flat_and_checker_fixtures_hold_their_exact_colors() {
 
 #[test]
 fn every_written_png_decodes_to_the_generated_rgba_bytes() {
-    let directory =
-        std::env::temp_dir().join(format!("tiny-webp-unit-8-fixtures-{}", std::process::id()));
+    let directory = std::env::temp_dir().join(format!(
+        "tiny-webp-every_written_png_decodes_to_the_generated_rgba_bytes-{}",
+        std::process::id()
+    ));
     if directory.exists() {
         std::fs::remove_dir_all(&directory).expect("remove the old test directory");
     }
@@ -96,7 +101,7 @@ fn every_written_png_decodes_to_the_generated_rgba_bytes() {
     let written = std::fs::read_dir(&directory)
         .expect("read the fixture directory")
         .count();
-    assert_eq!(written, 14);
+    assert_eq!(written, 15);
 
     for fixture in generator::all() {
         let input = File::open(directory.join(format!("{}.png", fixture.name)))
@@ -133,4 +138,32 @@ fn write_all(directory: &Path) {
         )
         .expect("write the PNG pixels");
     }
+}
+
+#[test]
+fn diagonals_pin_four_integer_edges_and_opaque_pixels() {
+    let fixtures = generator::all();
+    let fixture = fixtures
+        .iter()
+        .find(|fixture| fixture.name == "diagonals")
+        .unwrap();
+    assert_eq!((fixture.width, fixture.height), (48, 48));
+    for (x, y, value) in [
+        (10, 9, 24),
+        (10, 10, 240),
+        (34, 12, 24),
+        (34, 13, 240),
+        (10, 34, 24),
+        (10, 35, 240),
+        (35, 35, 24),
+        (35, 36, 240),
+    ] {
+        let offset = (y * 48 + x) * 4;
+        assert_eq!(
+            &fixture.rgba[offset..offset + 4],
+            &[value, value, value, 255]
+        );
+    }
+    let alpha: Vec<u8> = fixture.rgba.chunks_exact(4).map(|pixel| pixel[3]).collect();
+    assert_eq!(alpha, vec![255; 48 * 48]);
 }

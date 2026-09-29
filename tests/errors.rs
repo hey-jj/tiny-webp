@@ -1,5 +1,7 @@
 //! The text and the trait an `Error` carries.
 
+#![forbid(unsafe_code)]
+
 use tiny_webp::Error;
 
 #[test]

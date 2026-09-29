@@ -1,5 +1,7 @@
 //! Prints the fixture table or writes it as PNG files.
 
+#![forbid(unsafe_code)]
+
 #[path = "../fixtures/generator.rs"]
 mod generator;
 #[path = "../fixtures/png_writer.rs"]

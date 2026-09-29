@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 #![no_main]
 
 use std::io::Cursor;
@@ -62,5 +63,7 @@ fuzz_target!(|data: &[u8]| {
     assert_eq!(decoder.dimensions(), (width as u32, height as u32));
     let channels = if decoder.has_alpha() { 4 } else { 3 };
     let mut decoded = vec![0; width * height * channels];
-    assert_eq!(u8::from(decoder.read_image(&mut decoded).is_ok()), 1);
+    decoder
+        .read_image(&mut decoded)
+        .expect("decode the encoded pixels");
 });

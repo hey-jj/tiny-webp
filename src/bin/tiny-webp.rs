@@ -1,5 +1,7 @@
 //! The `tiny-webp` command line.
 
+#![forbid(unsafe_code)]
+
 use std::ffi::{OsStr, OsString};
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
@@ -383,7 +385,7 @@ fn summary(success: &Success) -> String {
             .replace("{height}", &success.height.to_string())
             .replace("{bytes}", &success.byte_count.to_string())
             .replace("{ms}", &(success.micros / 1000).to_string())
-            .replace("{micros}", &three_digits((success.micros % 1000) as u16))
+            .replace("{micros}", &format!("{:03}", success.micros % 1000))
     } else {
         let output = if success.output == OsStr::new("-") {
             STDOUT_NAME.into()
@@ -394,12 +396,4 @@ fn summary(success: &Success) -> String {
             .replace("{bytes}", &success.byte_count.to_string())
             .replace("{output}", &output)
     }
-}
-
-fn three_digits(value: u16) -> String {
-    let mut output = String::with_capacity(3);
-    output.push(char::from(b'0' + (value / 100) as u8));
-    output.push(char::from(b'0' + ((value / 10) % 10) as u8));
-    output.push(char::from(b'0' + (value % 10) as u8));
-    output
 }

@@ -1,5 +1,7 @@
 //! The fixed-point forward DCT against its real-valued definition.
 
+#![forbid(unsafe_code)]
+
 #[path = "../src/transform.rs"]
 mod transform;
 

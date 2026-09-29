@@ -1,5 +1,7 @@
 //! Prints SHA-256 digests for every fixed fixture encode.
 
+#![forbid(unsafe_code)]
+
 #[path = "../fixtures/generator.rs"]
 mod generator;
 
