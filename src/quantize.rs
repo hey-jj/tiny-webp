@@ -53,6 +53,9 @@ pub(crate) const Q_TO_INDEX: [u8; 101] = [
     3, 2, 1, 0, 0,
 ];
 
+// RFC 6386 section 9.6 orders Y DC, Y2 DC, Y2 AC, chroma DC, and chroma AC deltas.
+pub(crate) const QUANTIZER_DELTAS: [i8; 5] = [0, 0, 0, -2, -4];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct QuantizationFactors {
     pub(crate) y_dc: i32,
@@ -76,8 +79,9 @@ pub(crate) fn factors(index: u8) -> QuantizationFactors {
         y_ac: ac,
         y2_dc: 2 * dc,
         y2_ac: (ac * 155 / 100).max(8),
-        chroma_dc: dc.min(132),
-        chroma_ac: ac,
+        chroma_dc: DC_QLOOKUP[index.saturating_sub(QUANTIZER_DELTAS[3].unsigned_abs() as usize)]
+            .min(132),
+        chroma_ac: AC_QLOOKUP[index.saturating_sub(QUANTIZER_DELTAS[4].unsigned_abs() as usize)],
     }
 }
 
@@ -184,7 +188,7 @@ mod tests {
                 y2_dc: 314,
                 y2_ac: 440,
                 chroma_dc: 132,
-                chroma_ac: 284,
+                chroma_ac: 264,
             }
         );
     }
@@ -251,5 +255,16 @@ mod tests {
             quantize_block(&[2040; 16], set.chroma_ac, set.chroma_ac)[0],
         ];
         assert_eq!(largest_levels, [510, 510, 2040, 2040, 510, 510]);
+    }
+    #[test]
+    fn the_quantizer_deltas_keep_luma_and_reduce_chroma_indexes() {
+        assert_eq!(QUANTIZER_DELTAS.len(), 5);
+        assert_eq!(QUANTIZER_DELTAS.first(), Some(&0));
+        assert_eq!(QUANTIZER_DELTAS.last(), Some(&-4));
+        assert_eq!(QUANTIZER_DELTAS.into_iter().map(i32::from).sum::<i32>(), -6);
+        assert_eq!(factors(1).chroma_dc, 4);
+        assert_eq!(factors(3).chroma_ac, 4);
+        assert_eq!(factors(26).chroma_dc, 23);
+        assert_eq!(factors(26).chroma_ac, 26);
     }
 }

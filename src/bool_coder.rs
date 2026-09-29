@@ -4,6 +4,7 @@ const MAX_TREE_DEPTH: usize = 11;
 
 pub(crate) struct BoolEncoder {
     output: Vec<u8>,
+    start: usize,
     range: u32,
     bottom: u32,
     bit_count: u8,
@@ -15,13 +16,24 @@ impl BoolEncoder {
         Self::with_capacity(0)
     }
 
+    #[cfg(test)]
     pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self::from_output(Vec::with_capacity(capacity))
+    }
+
+    pub(crate) fn from_output(output: Vec<u8>) -> Self {
         Self {
-            output: Vec::with_capacity(capacity),
+            start: output.len(),
+            output,
             range: 255,
             bottom: 0,
             bit_count: 24,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn capacity(&self) -> usize {
+        self.output.capacity()
     }
 
     pub(crate) fn write_bool(&mut self, probability: u8, value: bool) {
@@ -50,6 +62,7 @@ impl BoolEncoder {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn write_literal(&mut self, value: u32, bit_count: u8) {
         for shift in (0..bit_count).rev() {
             self.write_bool(128, value & (1 << shift) != 0);
@@ -85,7 +98,7 @@ impl BoolEncoder {
     }
 
     fn propagate_carry(&mut self) {
-        for byte in self.output.iter_mut().rev() {
+        for byte in self.output[self.start..].iter_mut().rev() {
             if *byte == 255 {
                 *byte = 0;
             } else {
@@ -379,5 +392,20 @@ mod tests {
             };
             assert!(matches, "the decoded operation differs");
         }
+    }
+    #[test]
+    fn a_partition_preserves_its_prefix_when_carries_propagate() {
+        let mut bare = BoolEncoder::new();
+        let prefix = [255, 255, 255, 255];
+        let mut joined = BoolEncoder::from_output(prefix.to_vec());
+        for index in 0..4096 {
+            let probability = (index % 255 + 1) as u8;
+            let bit = index % 3 == 0;
+            bare.write_bool(probability, bit);
+            joined.write_bool(probability, bit);
+        }
+        let bytes = joined.finish();
+        assert_eq!(&bytes[..4], &prefix);
+        assert_eq!(&bytes[4..], bare.finish());
     }
 }

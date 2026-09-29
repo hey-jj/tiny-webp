@@ -4,10 +4,12 @@ use alloc::vec::Vec;
 use crate::bool_coder::BoolEncoder;
 use crate::color::{convert, YuvPlanes};
 use crate::prediction::{predict_chroma, predict_luma, CANDIDATES};
-use crate::quantize::{dequantize_block, factors, quantize_block, QuantizationFactors};
+use crate::quantize::{
+    dequantize_block, factors, quantize_block, QuantizationFactors, QUANTIZER_DELTAS,
+};
 use crate::residual::{
-    MacroblockResidual, ResidualWriter, TokenMacroblock, TokenStatistics, TokenStream,
-    COEFF_UPDATE_PROBS, DEFAULT_COEFF_PROBS,
+    BitEstimate, EntropyWriter, MacroblockResidual, ProbabilityWriter, ResidualWriter,
+    TokenMacroblock, TokenStatistics, TokenStream, COEFF_UPDATE_PROBS, DEFAULT_COEFF_PROBS,
 };
 use crate::transform::{clamped_add, forward_dct, forward_wht, inverse_dct, inverse_wht};
 use crate::{Alpha, Filter, Options};
@@ -155,6 +157,10 @@ pub(crate) struct EncodedFrame {
     pub(crate) webp: Vec<u8>,
     #[cfg(test)]
     pub(crate) reconstruction: YuvPlanes,
+    #[cfg(test)]
+    capacities: [(usize, usize); 3],
+    #[cfg(test)]
+    rung: u8,
 }
 
 pub(crate) fn encode(
@@ -185,10 +191,14 @@ fn encode_with_decision(
     options: &Options,
     decision: ModeDecision,
 ) -> EncodedFrame {
+    #[cfg(test)]
+    let partition_limit = decision.partition_limit;
+    #[cfg(not(test))]
+    let partition_limit = 524287;
+    let mut decision = decision;
     let source = convert(pixels, width, height, bytes_per_pixel);
-    let macroblock_columns = width.div_ceil(16);
-    let macroblock_rows = height.div_ceil(16);
-    let macroblock_count = macroblock_columns * macroblock_rows;
+    let columns = width.div_ceil(16);
+    let rows = height.div_ceil(16);
     let mut reconstruction = YuvPlanes {
         y: vec![0; source.y.len()],
         u: vec![0; source.u.len()],
@@ -196,57 +206,181 @@ fn encode_with_decision(
         y_stride: source.y_stride,
         chroma_stride: source.chroma_stride,
     };
-    let mut first_partition = BoolEncoder::with_capacity(160 + macroblock_count.div_ceil(2));
-    let mut second_partition = BoolEncoder::with_capacity(width * height);
-    let mut residual_writer = ResidualWriter::new(macroblock_columns);
-    let mut tokens = TokenStream::with_capacity(1 + 25 * 33);
-    let mut statistics = TokenStatistics::default();
+    let mut tokens =
+        TokenStream::with_capacity(columns * rows * TokenStream::MAX_BYTES_PER_MACROBLOCK);
     let quantization = factors(quantizer_index);
-    let mut mode_writer = ModeWriter::new(macroblock_columns);
+    for rung in 0..3 {
+        decision.whole_modes = if rung == 2 { 1 } else { 4 };
+        decision.subblocks = rung == 0;
+        tokens.clear();
+        reconstruction.y.fill(0);
+        reconstruction.u.fill(0);
+        reconstruction.v.fill(0);
+        let mut statistics = TokenStatistics::default();
+        let mut contexts = ResidualWriter::new(columns);
+        let mut unused = BitEstimate::default();
+        #[cfg(test)]
+        let token_capacity = tokens.capacity();
+        for row in 0..rows {
+            for column in 0..columns {
+                let selected =
+                    decision.analyze(&source, &mut reconstruction, (column, row), quantization);
+                let has_y2 = selected.luma_mode != SUBBLOCK_MODE;
+                statistics.record_macroblock(&selected.residual, has_y2);
+                if rung != 2 && !selected.residual.has_coefficients(has_y2) {
+                    contexts.skip_macroblock(column, has_y2);
+                } else {
+                    contexts.write_macroblock(
+                        &mut statistics.writer(&mut unused),
+                        column,
+                        &selected.residual,
+                        has_y2,
+                    );
+                }
+                tokens.push(&selected);
+            }
+        }
+        #[cfg(test)]
+        let token_capacities = (token_capacity, tokens.capacity());
+        let probabilities = statistics.probabilities();
+        let skip = if rung == 2 {
+            None
+        } else {
+            statistics.skip_probability()
+        };
+        let mut estimate = BitEstimate::default();
+        write_frame_header(
+            &mut estimate,
+            quantizer_index,
+            options.filter,
+            &probabilities,
+            skip,
+        );
+        write_modes(&mut estimate, &tokens, columns, skip);
+        let first_capacity = estimate.0.div_ceil(8 * 256) as usize + 64;
+        let second_capacity = statistics.estimated_bytes(&probabilities);
+        let (output, chunk_start) = start_riff(
+            pixels,
+            width,
+            height,
+            bytes_per_pixel,
+            options,
+            first_capacity + second_capacity,
+        );
+        let frame_start = output.len() - 10;
+        let first_start = output.len();
+        let mut first = BoolEncoder::from_output(output);
+        #[cfg(test)]
+        let first_before = first.capacity();
+        write_frame_header(
+            &mut first,
+            quantizer_index,
+            options.filter,
+            &probabilities,
+            skip,
+        );
+        write_modes(&mut first, &tokens, columns, skip);
+        let mut output = first.finish();
+        #[cfg(test)]
+        let first_capacities = (first_before, output.capacity());
+        let first_size = output.len() - first_start;
+        if first_size > partition_limit && rung < 2 {
+            continue;
+        }
+        // RFC 6386 section 19.1 gives the first partition length field nineteen bits.
+        assert!(
+            first_size <= 524287,
+            "the DC mode partition exceeds its field"
+        );
+        let tag = 0x10 | ((first_size as u32) << 5);
+        output[frame_start..frame_start + 3].copy_from_slice(&tag.to_le_bytes()[..3]);
+        drop(source);
+        #[cfg(not(test))]
+        drop(reconstruction);
+        let mut second = BoolEncoder::from_output(output);
+        #[cfg(test)]
+        let second_before = second.capacity();
+        let mut reader = tokens.reader();
+        let mut contexts = ResidualWriter::new(columns);
+        let mut position = 0;
+        while let Some(block) = reader.next_macroblock() {
+            let has_y2 = block.luma_mode != SUBBLOCK_MODE;
+            let column = position % columns;
+            if skip.is_some() && !block.residual.has_coefficients(has_y2) {
+                contexts.skip_macroblock(column, has_y2);
+            } else {
+                contexts.write_macroblock(
+                    &mut ProbabilityWriter {
+                        encoder: &mut second,
+                        probabilities: &probabilities,
+                    },
+                    column,
+                    &block.residual,
+                    has_y2,
+                );
+            }
+            position += 1;
+        }
+        let mut output = second.finish();
+        #[cfg(test)]
+        let second_capacities = (second_before, output.capacity());
+        let payload_size = output.len() - frame_start;
+        output[chunk_start + 4..chunk_start + 8]
+            .copy_from_slice(&(payload_size as u32).to_le_bytes());
+        if payload_size & 1 != 0 {
+            output.push(0);
+        }
+        let riff_size = (output.len() - 8) as u32;
+        output[4..8].copy_from_slice(&riff_size.to_le_bytes());
+        return EncodedFrame {
+            webp: output,
+            #[cfg(test)]
+            reconstruction,
+            #[cfg(test)]
+            capacities: [token_capacities, first_capacities, second_capacities],
+            #[cfg(test)]
+            rung,
+        };
+    }
+    unreachable!("the DC mode completes the frame")
+}
 
-    write_frame_header(&mut first_partition, quantizer_index, options.filter);
-    for macroblock_y in 0..macroblock_rows {
-        for macroblock_x in 0..macroblock_columns {
-            let selected = decision.analyze(
-                &source,
-                &mut reconstruction,
-                (macroblock_x, macroblock_y),
-                quantization,
-            );
-            tokens.clear();
-            tokens.push(&selected);
-            let stored = tokens
-                .reader()
-                .next_macroblock()
-                .expect("the stream holds one macroblock");
-            mode_writer.write_macroblock(
-                &mut first_partition,
-                macroblock_x,
-                stored.luma_mode,
-                stored.chroma_mode,
-                &stored.subblock_modes,
-            );
-            statistics.record_macroblock(&stored.residual, stored.luma_mode != SUBBLOCK_MODE);
-            residual_writer.write_macroblock(
-                &mut statistics.writer(&mut second_partition),
-                macroblock_x,
-                &stored.residual,
-                stored.luma_mode != SUBBLOCK_MODE,
+fn write_modes<W: EntropyWriter>(
+    encoder: &mut W,
+    tokens: &TokenStream,
+    columns: usize,
+    skip: Option<u8>,
+) {
+    let mut writer = ModeWriter::new(columns);
+    let mut reader = tokens.reader();
+    let mut position = 0;
+    while let Some(block) = reader.next_macroblock() {
+        if let Some(probability) = skip {
+            encoder.write_bool(
+                probability,
+                !block
+                    .residual
+                    .has_coefficients(block.luma_mode != SUBBLOCK_MODE),
             );
         }
-    }
-
-    let first_partition = first_partition.finish();
-    let second_partition = second_partition.finish();
-    let vp8 = assemble_vp8(width, height, &first_partition, &second_partition);
-    EncodedFrame {
-        webp: assemble_riff(&vp8, pixels, width, height, bytes_per_pixel, options),
-        #[cfg(test)]
-        reconstruction,
+        writer.write_macroblock(
+            encoder,
+            position % columns,
+            block.luma_mode,
+            block.chroma_mode,
+            &block.subblock_modes,
+        );
+        position += 1;
     }
 }
 
-fn write_frame_header(encoder: &mut BoolEncoder, quantizer_index: u8, filter: Filter) {
+fn write_frame_header<W: EntropyWriter>(
+    encoder: &mut W,
+    quantizer_index: u8,
+    filter: Filter,
+    probabilities: &[u8; 1056],
+    skip_probability: Option<u8>,
+) {
     let (level, sharpness) = match filter {
         Filter::Level { level, sharpness } => (level.min(63), sharpness.min(7)),
         Filter::Auto | Filter::Off => (0, 0),
@@ -276,18 +410,21 @@ fn write_frame_header(encoder: &mut BoolEncoder, quantizer_index: u8, filter: Fi
     encoder.write_literal(0, 1);
     // RFC 6386 section 9.6 keeps the base Y2 AC index with y2_ac_delta_present 0.
     encoder.write_literal(0, 1);
-    // RFC 6386 section 9.6 keeps the base chroma DC index with uv_dc_delta_present 0.
-    encoder.write_literal(0, 1);
-    // RFC 6386 section 9.6 keeps the base chroma AC index with uv_ac_delta_present 0.
-    encoder.write_literal(0, 1);
+    // RFC 6386 section 9.6 encodes chroma DC delta -2 as magnitude and sign.
+    encoder.write_literal(1, 1);
+    encoder.write_literal(u32::from(QUANTIZER_DELTAS[3].unsigned_abs()), 4);
+    encoder.write_literal(1, 1);
+    // RFC 6386 section 9.6 encodes chroma AC delta -4 as magnitude and sign.
+    encoder.write_literal(1, 1);
+    encoder.write_literal(u32::from(QUANTIZER_DELTAS[4].unsigned_abs()), 4);
+    encoder.write_literal(1, 1);
     // RFC 6386 section 19.2 retains token probabilities with refresh_entropy_probs 1.
     encoder.write_literal(1, 1);
-    // RFC 6386 section 13.4 retains each default with token_prob_update 0.
-    let statistics = TokenStatistics::default();
+    // RFC 6386 section 13.4 replaces a probability after each set update flag.
     for ((probability, default), selected) in COEFF_UPDATE_PROBS
         .into_iter()
         .zip(DEFAULT_COEFF_PROBS)
-        .zip(statistics.probabilities())
+        .zip(probabilities.iter().copied())
     {
         let update = selected != default;
         encoder.write_bool(probability, update);
@@ -296,7 +433,6 @@ fn write_frame_header(encoder: &mut BoolEncoder, quantizer_index: u8, filter: Fi
         }
     }
     // RFC 6386 section 9.11 requires a probability when mb_no_skip_coeff is 1.
-    let skip_probability = statistics.skip_probability();
     encoder.write_bool(128, skip_probability.is_some());
     if let Some(probability) = skip_probability {
         encoder.write_literal(u32::from(probability), 8);
@@ -316,9 +452,9 @@ impl ModeWriter {
         }
     }
 
-    fn write_macroblock(
+    fn write_macroblock<W: EntropyWriter>(
         &mut self,
-        encoder: &mut BoolEncoder,
+        encoder: &mut W,
         macroblock_x: usize,
         luma_mode: u8,
         chroma_mode: u8,
@@ -343,9 +479,9 @@ impl ModeWriter {
         &KF_B_MODE_PROBS[usize::from(self.above[column])][usize::from(self.left[row])]
     }
 
-    fn write_subblock_modes(
+    fn write_subblock_modes<W: EntropyWriter>(
         &mut self,
-        encoder: &mut BoolEncoder,
+        encoder: &mut W,
         macroblock_x: usize,
         modes: &[u8; 16],
     ) {
@@ -367,11 +503,21 @@ fn derived_subblock_mode(luma_mode: u8) -> u8 {
 
 struct ModeDecision {
     early_exit: bool,
+    whole_modes: usize,
+    subblocks: bool,
+    #[cfg(test)]
+    partition_limit: usize,
 }
 
 impl Default for ModeDecision {
     fn default() -> Self {
-        Self { early_exit: true }
+        Self {
+            early_exit: true,
+            whole_modes: 4,
+            subblocks: true,
+            #[cfg(test)]
+            partition_limit: 524287,
+        }
     }
 }
 
@@ -396,7 +542,7 @@ impl ModeDecision {
         let mut selected = TokenMacroblock::default();
         let mut best_distortion = u64::MAX;
         let mut best_luma = [0; 256];
-        for (mode, &candidate) in CANDIDATES[..4].iter().enumerate() {
+        for (mode, &candidate) in CANDIDATES[..self.whole_modes].iter().enumerate() {
             let prediction = predict_luma(
                 &reconstruction.y,
                 source.y_stride,
@@ -431,7 +577,7 @@ impl ModeDecision {
                 break;
             }
         }
-        if !self.finished(best_distortion) {
+        if self.subblocks && !self.finished(best_distortion) {
             let mut candidate = TokenMacroblock {
                 luma_mode: SUBBLOCK_MODE,
                 ..TokenMacroblock::default()
@@ -463,7 +609,7 @@ impl ModeDecision {
         let mut best_distortion = u64::MAX;
         let mut best_u = [0; 64];
         let mut best_v = [0; 64];
-        for (mode, &candidate) in CANDIDATES[..4].iter().enumerate() {
+        for (mode, &candidate) in CANDIDATES[..self.whole_modes].iter().enumerate() {
             let mut residual = MacroblockResidual::default();
             for (input, output, levels) in [
                 (&source.u, &mut reconstruction.u, &mut residual.u),
@@ -795,42 +941,24 @@ fn write_reconstruction_block(
     }
 }
 
-fn assemble_vp8(
-    width: usize,
-    height: usize,
-    first_partition: &[u8],
-    second_partition: &[u8],
-) -> Vec<u8> {
-    let mut vp8 = Vec::with_capacity(10 + first_partition.len() + second_partition.len());
-    let frame_tag = 0x10 | ((first_partition.len() as u32) << 5);
-    vp8.extend_from_slice(&frame_tag.to_le_bytes()[..3]);
-    vp8.extend_from_slice(&[0x9d, 0x01, 0x2a]);
-    vp8.extend_from_slice(&(width as u16).to_le_bytes());
-    vp8.extend_from_slice(&(height as u16).to_le_bytes());
-    vp8.extend_from_slice(first_partition);
-    vp8.extend_from_slice(second_partition);
-    vp8
-}
-
-fn assemble_riff(
-    vp8: &[u8],
+fn start_riff(
     pixels: &[u8],
     width: usize,
     height: usize,
     bytes_per_pixel: usize,
     options: &Options,
-) -> Vec<u8> {
+    partition_capacity: usize,
+) -> (Vec<u8>, usize) {
     let has_alpha = bytes_per_pixel == 4
         && options.alpha == Alpha::Lossless
         && pixels[3..].iter().step_by(4).any(|value| *value != 255);
     let extended = has_alpha || options.force_vp8x;
-    let vp8_padding = vp8.len() & 1;
     let alpha_size = usize::from(has_alpha) * (1 + width * height);
     let alpha_padding = alpha_size & 1;
     let extended_size = usize::from(extended) * 18;
     let alpha_chunk_size = usize::from(has_alpha) * (8 + alpha_size + alpha_padding);
     let mut output =
-        Vec::with_capacity(20 + vp8.len() + vp8_padding + extended_size + alpha_chunk_size);
+        Vec::with_capacity(30 + partition_capacity + 1 + extended_size + alpha_chunk_size);
     output.extend_from_slice(b"RIFF");
     output.extend_from_slice(&[0; 4]);
     output.extend_from_slice(b"WEBP");
@@ -856,15 +984,13 @@ fn assemble_riff(
         }
     }
 
+    let chunk_start = output.len();
     output.extend_from_slice(b"VP8 ");
-    output.extend_from_slice(&(vp8.len() as u32).to_le_bytes());
-    output.extend_from_slice(vp8);
-    if vp8_padding != 0 {
-        output.push(0);
-    }
-    let riff_size = (output.len() - 8) as u32;
-    output[4..8].copy_from_slice(&riff_size.to_le_bytes());
-    output
+    output.extend_from_slice(&[0; 7]);
+    output.extend_from_slice(&[0x9d, 0x01, 0x2a]);
+    output.extend_from_slice(&(width as u16).to_le_bytes());
+    output.extend_from_slice(&(height as u16).to_le_bytes());
+    (output, chunk_start)
 }
 
 #[cfg(test)]
@@ -1116,7 +1242,7 @@ mod tests {
         assert_eq!(frame_tag & 1, 0);
         assert_eq!((frame_tag >> 1) & 7, 0);
         assert_eq!((frame_tag >> 4) & 1, 1);
-        assert_eq!(first_partition_size, 11);
+        assert_eq!(first_partition_size, 14);
         assert_eq!(&payload[3..6], &[0x9d, 0x01, 0x2a]);
         assert_eq!(u16::from_le_bytes([payload[6], payload[7]]), 3);
         assert_eq!(u16::from_le_bytes([payload[8], payload[9]]), 2);
@@ -1131,13 +1257,16 @@ mod tests {
         assert_eq!(header.read_literal(1), 0);
         assert_eq!(header.read_literal(2), 0);
         assert_eq!(header.read_literal(7), 38);
-        for _ in 0..5 {
-            assert_eq!(header.read_literal(1), 0);
-        }
+        assert_eq!(read_deltas(&mut header), [0, 0, 0, -2, -4]);
         assert_eq!(header.read_literal(1), 1);
-        for probability in crate::residual::COEFF_UPDATE_PROBS {
-            assert_eq!(u8::from(header.read_bool(probability)), 0);
-        }
+        let probabilities = read_updates(&mut header);
+        let updates: Vec<_> = probabilities
+            .into_iter()
+            .zip(crate::residual::DEFAULT_COEFF_PROBS)
+            .enumerate()
+            .filter_map(|(index, (sent, default))| (sent != default).then_some((index, sent)))
+            .collect();
+        assert_eq!(updates, [(528, 1)]);
         assert_eq!(header.read_literal(1), 0);
         assert_eq!(
             read_frame_modes(&encoded, 1, 1),
@@ -1219,13 +1348,19 @@ mod tests {
     fn the_largest_frame_keeps_its_first_partition_inside_nineteen_bits() {
         let macroblock_count = 1024 * 1024;
         let mut partition = BoolEncoder::with_capacity(524_288);
-        write_frame_header(&mut partition, 0, Filter::Off);
+        write_frame_header(
+            &mut partition,
+            0,
+            Filter::Off,
+            &crate::residual::DEFAULT_COEFF_PROBS,
+            None,
+        );
         for _ in 0..macroblock_count {
             partition.write_tree(&KF_Y_MODE_TREE, &KF_Y_MODE_PROBS, 0, 0);
             partition.write_tree(&UV_MODE_TREE, &KF_UV_MODE_PROBS, 0, 0);
         }
         let partition_size = partition.finish().len();
-        assert_eq!(partition_size, 449_397);
+        assert_eq!(partition_size, 449_398);
         assert_eq!(partition_size >> 19, 0);
     }
 
@@ -1609,8 +1744,8 @@ mod tests {
         );
         let selected = decision.analyze(&source, &mut reconstruction, (1, 1), quantization);
         assert_eq!(luma_scores, [16861, 16709, 17237, 19288, 13603]);
-        assert_eq!(u_scores, [4623, 4659, 3760, 5017]);
-        assert_eq!(v_scores, [2526, 1695, 3472, 5738]);
+        assert_eq!(u_scores, [2456, 2744, 2620, 3127]);
+        assert_eq!(v_scores, [1667, 1155, 1748, 4242]);
         assert_eq!((selected.luma_mode, selected.chroma_mode), (4, 1));
         assert_eq!(
             super::block_distortion::<16>(&source.y, &reconstruction.y, 32, (1, 1)),
@@ -1730,26 +1865,31 @@ mod tests {
     }
 
     fn read_frame_modes(webp: &[u8], columns: usize, rows: usize) -> Vec<(u8, u8, [u8; 16])> {
+        read_frame_records(webp, columns, rows).0
+    }
+
+    type FrameRecords = (Vec<(u8, u8, [u8; 16])>, Vec<bool>, [u8; 1056]);
+
+    fn read_frame_records(webp: &[u8], columns: usize, rows: usize) -> FrameRecords {
         let mut decoder = crate::bool_coder::BoolDecoder::new(&webp[30..]);
         for width in [1, 1, 1, 1, 6, 3, 1, 2] {
             assert_eq!(decoder.read_literal(width), 0);
         }
         decoder.read_literal(7);
-        for _ in 0..5 {
-            assert_eq!(decoder.read_literal(1), 0);
-        }
+        assert_eq!(read_deltas(&mut decoder), [0, 0, 0, -2, -4]);
         assert_eq!(decoder.read_literal(1), 1);
-        for probability in crate::residual::COEFF_UPDATE_PROBS {
-            assert!(
-                !decoder.read_bool(probability),
-                "the frame keeps default probabilities"
-            );
-        }
-        assert_eq!(decoder.read_literal(1), 0);
+        let probabilities = read_updates(&mut decoder);
+        let mut skips = Vec::new();
+        let skip = if decoder.read_bool(128) {
+            Some(decoder.read_literal(8) as u8)
+        } else {
+            None
+        };
         let mut blocks = vec![0usize; columns * rows * 16];
         let mut result = Vec::new();
         for row in 0..rows {
             for column in 0..columns {
+                skips.push(skip.is_some_and(|probability| decoder.read_bool(probability)));
                 let luma = decoder.read_tree(&KF_Y_MODE_TREE, &KF_Y_MODE_PROBS, 0);
                 let mut modes = [0; 16];
                 for (block, mode) in modes.iter_mut().enumerate() {
@@ -1777,7 +1917,7 @@ mod tests {
                 result.push((luma, chroma, modes));
             }
         }
-        result
+        (result, skips, probabilities)
     }
 
     fn alpha_bytes(rgba: &[u8]) -> Vec<u8> {
@@ -2063,6 +2203,10 @@ mod tests {
     }
 
     fn read_quantizer_index(webp: &[u8]) -> u8 {
+        read_quantizer_fields(webp).0
+    }
+
+    fn read_quantizer_fields(webp: &[u8]) -> (u8, [i8; 5]) {
         assert_eq!(&webp[..4], b"RIFF");
         assert_eq!(&webp[8..12], b"WEBP");
         assert_eq!(&webp[12..16], b"VP8 ");
@@ -2103,6 +2247,297 @@ mod tests {
             }
         }
         decoder.read_literal(2);
-        decoder.read_literal(7) as u8
+        let index = decoder.read_literal(7) as u8;
+        (index, read_deltas(&mut decoder))
+    }
+    fn read_deltas(decoder: &mut crate::bool_coder::BoolDecoder<'_>) -> [i8; 5] {
+        core::array::from_fn(|_| {
+            if decoder.read_bool(128) {
+                let magnitude = decoder.read_literal(4) as i8;
+                if decoder.read_bool(128) {
+                    -magnitude
+                } else {
+                    magnitude
+                }
+            } else {
+                0
+            }
+        })
+    }
+
+    fn read_updates(decoder: &mut crate::bool_coder::BoolDecoder<'_>) -> [u8; 1056] {
+        let mut probabilities = crate::residual::DEFAULT_COEFF_PROBS;
+        for (selected, update) in probabilities
+            .iter_mut()
+            .zip(crate::residual::COEFF_UPDATE_PROBS)
+        {
+            if decoder.read_bool(update) {
+                *selected = decoder.read_literal(8) as u8;
+            }
+        }
+        probabilities
+    }
+
+    #[test]
+    fn cwebp_writes_the_chroma_deltas_and_quality_index_for_every_fixture() {
+        if !oracle_is_available("cwebp") {
+            return;
+        }
+        let directory =
+            scratch_directory("cwebp_writes_the_chroma_deltas_and_quality_index_for_every_fixture");
+        let input = directory.join("input.png");
+        let output = directory.join("output.webp");
+        for fixture in generator::all() {
+            write_png(&input, &fixture);
+            for quality in [25, 50, 75, 90, 95] {
+                let status = Command::new("cwebp")
+                    .args(["-quiet", "-q", &quality.to_string(), "-segments", "1"])
+                    .arg(&input)
+                    .arg("-o")
+                    .arg(&output)
+                    .status()
+                    .expect("run cwebp");
+                assert_eq!(status.code(), Some(0));
+                let webp = fs::read(&output).expect("read the cwebp image");
+                let payload = vp8_payload(&webp);
+                let mut opaque = b"RIFF\0\0\0\0WEBPVP8 ".to_vec();
+                opaque.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+                opaque.extend_from_slice(payload);
+                assert_eq!(
+                    read_quantizer_fields(&opaque),
+                    (quantizer_index(quality), [0, 0, 0, -2, -4]),
+                    "{} q {quality}",
+                    fixture.name
+                );
+            }
+        }
+        fs::remove_dir_all(directory).expect("remove the test directory");
+    }
+
+    fn vp8_payload(webp: &[u8]) -> &[u8] {
+        let mut position = 12;
+        loop {
+            let size =
+                u32::from_le_bytes(webp[position + 4..position + 8].try_into().unwrap()) as usize;
+            if &webp[position..position + 4] == b"VP8 " {
+                return &webp[position + 8..position + 8 + size];
+            }
+            position += 8 + size + (size & 1);
+        }
+    }
+
+    #[test]
+    fn every_calibration_buffer_keeps_its_capacity_across_the_macroblock_loops() {
+        let mut changes = Vec::new();
+        for fixture in generator::all() {
+            for quality in [50, 75, 90] {
+                let encoded = encode(
+                    &fixture.rgba,
+                    fixture.width as usize,
+                    fixture.height as usize,
+                    4,
+                    quantizer_index(quality),
+                    &Options::default(),
+                );
+                for (buffer, (before, after)) in encoded.capacities.into_iter().enumerate() {
+                    if before != after {
+                        changes.push((fixture.name, quality, buffer, before, after));
+                    }
+                }
+            }
+        }
+        assert_eq!(changes, []);
+    }
+
+    #[test]
+    fn noise_and_the_largest_swept_dimensions_keep_token_capacity_at_quality_100() {
+        for (name, width, height) in [
+            ("noise", 64, 48),
+            ("dimension-sweep", 48, 48),
+            ("long-dimension-sweep", 16383, 1),
+            ("long-dimension-sweep", 1, 16383),
+            ("long-dimension-sweep", 16383, 3),
+            ("long-dimension-sweep", 3, 16383),
+            ("long-dimension-sweep", 4097, 1),
+            ("long-dimension-sweep", 1, 4097),
+        ] {
+            let fixture = generator::noise(name, width, height);
+            for bytes_per_pixel in [3, 4] {
+                let pixels = if bytes_per_pixel == 3 {
+                    rgb_bytes(&fixture.rgba)
+                } else {
+                    fixture.rgba.clone()
+                };
+                let encoded = encode(
+                    &pixels,
+                    width as usize,
+                    height as usize,
+                    bytes_per_pixel,
+                    quantizer_index(100),
+                    &Options::default(),
+                );
+                let (before, after) = encoded.capacities[0];
+                assert_eq!(
+                    before,
+                    width.div_ceil(16) as usize * height.div_ceil(16) as usize * 801
+                );
+                assert_eq!(
+                    after, before,
+                    "{width}x{height}, {bytes_per_pixel} channels"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_header_round_trips_sent_probabilities_deltas_and_skip_probability() {
+        let mut probabilities = crate::residual::DEFAULT_COEFF_PROBS;
+        probabilities[0] = 1;
+        probabilities[1055] = 255;
+        let mut encoder = BoolEncoder::new();
+        write_frame_header(&mut encoder, 26, Filter::Off, &probabilities, Some(64));
+        let bytes = encoder.finish();
+        let mut decoder = crate::bool_coder::BoolDecoder::new(&bytes);
+        for width in [1, 1, 1, 1, 6, 3, 1, 2] {
+            assert_eq!(decoder.read_literal(width), 0);
+        }
+        assert_eq!(decoder.read_literal(7), 26);
+        assert_eq!(read_deltas(&mut decoder), [0, 0, 0, -2, -4]);
+        assert_eq!(decoder.read_literal(1), 1);
+        assert_eq!(read_updates(&mut decoder), probabilities);
+        assert_eq!(decoder.read_literal(1), 1);
+        assert_eq!(decoder.read_literal(8), 64);
+    }
+
+    #[test]
+    fn the_partition_limit_drives_three_rungs_with_exact_reconstruction() {
+        if !oracle_is_available("dwebp") {
+            return;
+        }
+        let directory =
+            scratch_directory("the_partition_limit_drives_three_rungs_with_exact_reconstruction");
+        let fixtures = generator::all();
+        let fixture = fixtures
+            .iter()
+            .find(|fixture| fixture.name == "diagonals")
+            .unwrap();
+        let mut lengths = [0; 3];
+        let mut limit = 524287;
+        for (rung, length) in lengths.iter_mut().enumerate() {
+            let decision = super::ModeDecision {
+                partition_limit: limit,
+                ..super::ModeDecision::default()
+            };
+            let encoded = super::encode_with_decision(
+                &fixture.rgba,
+                fixture.width as usize,
+                fixture.height as usize,
+                4,
+                quantizer_index(75),
+                &Options::default(),
+                decision,
+            );
+            assert_eq!(usize::from(encoded.rung), rung);
+            assert_encoded_reconstruction(&directory, fixture, quantizer_index(75), &encoded);
+            let payload = vp8_payload(&encoded.webp);
+            *length = (u32::from_le_bytes([payload[0], payload[1], payload[2], 0]) >> 5) as usize;
+            limit = *length - 1;
+        }
+        assert_eq!(lengths, [137, 104, 104]);
+        fs::remove_dir_all(directory).expect("remove the test directory");
+    }
+    #[test]
+    fn flat_at_quality_75_has_top_left_dc_levels_and_zero_residuals_after_it() {
+        let fixtures = generator::all();
+        let fixture = fixtures
+            .iter()
+            .find(|fixture| fixture.name == "flat")
+            .unwrap();
+        let index = quantizer_index(75);
+        assert_eq!(index, 26);
+        assert_eq!(
+            index - crate::quantize::QUANTIZER_DELTAS[3].unsigned_abs(),
+            24
+        );
+        assert_eq!(factors(index).chroma_dc, 23);
+        let source = crate::color::convert(&fixture.rgba, 32, 32, 4);
+        let mut reconstruction = crate::color::YuvPlanes {
+            y: vec![0; 1024],
+            u: vec![0; 256],
+            v: vec![0; 256],
+            y_stride: 32,
+            chroma_stride: 16,
+        };
+        let decision = super::ModeDecision::default();
+        let mut residual_skips = [false; 4];
+        for (position, skip) in residual_skips.iter_mut().enumerate() {
+            let selected = decision.analyze(
+                &source,
+                &mut reconstruction,
+                (position % 2, position / 2),
+                factors(index),
+            );
+            let mut expected = crate::residual::MacroblockResidual::default();
+            if position == 0 {
+                assert_eq!((selected.luma_mode, selected.chroma_mode), (0, 1));
+                expected.y2[0] = -9;
+                for block in &mut expected.u {
+                    block[0] = 7;
+                }
+                for block in &mut expected.v {
+                    block[0] = -5;
+                }
+            }
+            assert_eq!(selected.residual, expected, "macroblock {position}");
+            *skip = !selected.residual.has_coefficients(true);
+        }
+        assert_eq!(residual_skips, [false, true, true, true]);
+    }
+
+    #[test]
+    fn flat_at_quality_75_skips_the_three_macroblocks_after_the_top_left() {
+        let fixtures = generator::all();
+        let fixture = fixtures
+            .iter()
+            .find(|fixture| fixture.name == "flat")
+            .unwrap();
+        let encoded = encode(
+            &fixture.rgba,
+            32,
+            32,
+            4,
+            quantizer_index(75),
+            &Options::default(),
+        );
+        let (modes, skips, _) = read_frame_records(&encoded.webp, 2, 2);
+        assert_eq!(modes[0], (0, 1, [0; 16]));
+        assert_eq!(skips, [false, true, true, true]);
+    }
+
+    #[test]
+    fn noise_at_quality_zero_codes_every_macroblock() {
+        let fixtures = generator::all();
+        let fixture = fixtures
+            .iter()
+            .find(|fixture| fixture.name == "noise")
+            .unwrap();
+        let encoded = encode(
+            &fixture.rgba,
+            64,
+            48,
+            4,
+            quantizer_index(0),
+            &Options::default(),
+        );
+        let (_, skips, probabilities) = read_frame_records(&encoded.webp, 4, 3);
+        assert_eq!(skips, [false; 12]);
+        assert_eq!(
+            probabilities
+                .iter()
+                .zip(crate::residual::DEFAULT_COEFF_PROBS)
+                .filter(|(a, b)| **a != *b)
+                .count(),
+            14
+        );
     }
 }

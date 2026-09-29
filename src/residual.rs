@@ -204,19 +204,20 @@ impl TokenStatistics {
     }
 
     pub(crate) fn record_macroblock(&mut self, residual: &MacroblockResidual, has_y2: bool) {
-        let nonzero = (has_y2 && residual.y2.iter().any(|&level| level != 0))
-            || residual
-                .y
-                .iter()
-                .any(|block| block[usize::from(has_y2)..].iter().any(|&level| level != 0))
-            || residual
-                .u
-                .iter()
-                .chain(&residual.v)
-                .flatten()
-                .any(|&level| level != 0);
+        let nonzero = residual.has_coefficients(has_y2);
         self.coded += u64::from(nonzero);
         self.total += 1;
+    }
+
+    pub(crate) fn estimated_bytes(&self, probabilities: &[u8; COEFF_PROB_COUNT]) -> usize {
+        let cost =
+            self.counts
+                .iter()
+                .zip(probabilities)
+                .fold(self.fixed_cost, |cost, (counts, &p)| {
+                    cost + counts[0] * bool_cost(p, false) + counts[1] * bool_cost(p, true)
+                });
+        cost.div_ceil(8 * 256) as usize + 64
     }
 
     pub(crate) fn skip_probability(&self) -> Option<u8> {
@@ -235,6 +236,23 @@ impl TokenStatistics {
                 COEFF_UPDATE_PROBS[index],
             )
         })
+    }
+}
+
+impl MacroblockResidual {
+    pub(crate) fn has_coefficients(&self, has_y2: bool) -> bool {
+        let residual = self;
+        (has_y2 && residual.y2.iter().any(|&level| level != 0))
+            || residual
+                .y
+                .iter()
+                .any(|block| block[usize::from(has_y2)..].iter().any(|&level| level != 0))
+            || residual
+                .u
+                .iter()
+                .chain(&residual.v)
+                .flatten()
+                .any(|&level| level != 0)
     }
 }
 
@@ -310,10 +328,19 @@ pub(crate) struct TokenStream {
 }
 
 impl TokenStream {
+    // B_PRED needs 1 mode byte + 8 sub-block mode bytes + 24 * (1 + 16 * 2) bytes.
+    // The Y2 form needs 1 + 25 + (16 + 16 * 15 + 8 * 16) * 2 = 794 bytes.
+    pub(crate) const MAX_BYTES_PER_MACROBLOCK: usize = 801;
+
     pub(crate) fn with_capacity(capacity: usize) -> Self {
         Self {
             bytes: Vec::with_capacity(capacity),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn capacity(&self) -> usize {
+        self.bytes.capacity()
     }
 
     pub(crate) fn clear(&mut self) {
@@ -444,6 +471,23 @@ impl ResidualWriter {
             left_u: [false; 2],
             left_v: [false; 2],
             left_y2: false,
+        }
+    }
+
+    pub(crate) fn skip_macroblock(&mut self, column: usize, has_y2: bool) {
+        // RFC 6386 section 13.3 retains the last Y2 context across B_PRED.
+        if column == 0 {
+            self.left_y2 = false;
+        }
+        self.left_y.fill(false);
+        self.left_u.fill(false);
+        self.left_v.fill(false);
+        self.above_y[column * 4..column * 4 + 4].fill(false);
+        self.above_u[column * 2..column * 2 + 2].fill(false);
+        self.above_v[column * 2..column * 2 + 2].fill(false);
+        if has_y2 {
+            self.left_y2 = false;
+            self.above_y2[column] = false;
         }
     }
 
@@ -651,6 +695,12 @@ fn coefficient_probabilities(plane: usize, band: usize, context: usize) -> &'sta
 pub(crate) trait EntropyWriter {
     fn write_bool(&mut self, probability: u8, value: bool);
 
+    fn write_literal(&mut self, value: u32, bits: u8) {
+        for shift in (0..bits).rev() {
+            self.write_bool(128, value & (1 << shift) != 0);
+        }
+    }
+
     fn write_coefficient_token(&mut self, start: usize, token: u8, start_node: usize) {
         self.write_tree(
             &COEFF_TREE,
@@ -661,6 +711,46 @@ pub(crate) trait EntropyWriter {
     }
 
     fn write_tree(&mut self, tree: &[i8], probabilities: &[u8], value: u8, start_node: usize);
+}
+
+pub(crate) struct ProbabilityWriter<'a> {
+    pub(crate) encoder: &'a mut BoolEncoder,
+    pub(crate) probabilities: &'a [u8; COEFF_PROB_COUNT],
+}
+
+impl EntropyWriter for ProbabilityWriter<'_> {
+    fn write_bool(&mut self, probability: u8, value: bool) {
+        self.encoder.write_bool(probability, value);
+    }
+
+    fn write_tree(&mut self, tree: &[i8], probabilities: &[u8], value: u8, start: usize) {
+        self.encoder.write_tree(tree, probabilities, value, start);
+    }
+
+    fn write_coefficient_token(&mut self, start: usize, token: u8, node: usize) {
+        self.encoder.write_tree(
+            &COEFF_TREE,
+            &self.probabilities[start..start + TREE_NODE_COUNT],
+            token,
+            node,
+        );
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct BitEstimate(pub(crate) u64);
+
+impl EntropyWriter for BitEstimate {
+    fn write_bool(&mut self, probability: u8, value: bool) {
+        self.0 += bool_cost(probability, value);
+    }
+
+    fn write_tree(&mut self, tree: &[i8], probabilities: &[u8], value: u8, start: usize) {
+        let (writes, count) = tree_writes(tree, probabilities, value, start);
+        for &(probability, bit) in &writes[..count] {
+            self.write_bool(probability, bit);
+        }
+    }
 }
 
 impl EntropyWriter for BoolEncoder {
@@ -1422,6 +1512,45 @@ mod tests {
     }
 
     #[test]
+    fn dense_macroblocks_fit_the_stream_byte_bound() {
+        for luma_mode in 0..5 {
+            let mut block = TokenMacroblock {
+                luma_mode,
+                chroma_mode: 3,
+                subblock_modes: [0; 16],
+                ..TokenMacroblock::default()
+            };
+            if luma_mode == 4 {
+                block.subblock_modes.fill(9);
+            } else {
+                block.residual.y2.fill(2047);
+            }
+            for levels in &mut block.residual.y {
+                levels.fill(-2047);
+                if luma_mode != 4 {
+                    levels[0] = 0;
+                }
+            }
+            for levels in block.residual.u.iter_mut().chain(&mut block.residual.v) {
+                levels.fill(2047);
+            }
+            let mut stream = TokenStream::with_capacity(3 * TokenStream::MAX_BYTES_PER_MACROBLOCK);
+            let before = stream.capacity();
+            for _ in 0..3 {
+                stream.push(&block);
+            }
+            assert_eq!(before, 2403);
+            assert_eq!(stream.capacity(), before);
+            assert_eq!(stream.bytes.len(), if luma_mode == 4 { 2403 } else { 2382 });
+            let mut reader = stream.reader();
+            for _ in 0..3 {
+                assert_eq!(reader.next_macroblock(), Some(block.clone()));
+            }
+            assert_eq!(reader.next_macroblock(), None);
+        }
+    }
+
+    #[test]
     fn compact_blocks_store_only_coded_positions_through_the_last_nonzero() {
         let mut stream = TokenStream::with_capacity(826);
         stream.push(&TokenMacroblock::default());
@@ -1450,5 +1579,36 @@ mod tests {
         block.residual.y2[1] = -2114;
         assert_eq!(&stream.bytes[..6], &[0, 2, 132, 33, 133, 33]);
         assert_eq!(stream.reader().next_macroblock(), Some(block));
+    }
+    #[test]
+    fn skipped_blocks_clear_coded_contexts_and_retain_absent_y2_neighbors() {
+        let mut writer = ResidualWriter::new(2);
+        writer.above_y.fill(true);
+        writer.above_u.fill(true);
+        writer.above_v.fill(true);
+        writer.above_y2.fill(true);
+        writer.left_y.fill(true);
+        writer.left_u.fill(true);
+        writer.left_v.fill(true);
+        writer.left_y2 = true;
+        writer.skip_macroblock(1, false);
+        assert_eq!(
+            writer.above_y,
+            [true, true, true, true, false, false, false, false]
+        );
+        assert_eq!(writer.above_u, [true, true, false, false]);
+        assert_eq!(writer.above_v, [true, true, false, false]);
+        assert_eq!(writer.above_y2, [true, true]);
+        assert_eq!([writer.left_y2], [true]);
+        assert_eq!(writer.left_y, [false; 4]);
+        assert_eq!(writer.left_u, [false; 2]);
+        assert_eq!(writer.left_v, [false; 2]);
+        writer.skip_macroblock(1, true);
+        assert_eq!(writer.above_y2, [true, false]);
+        assert_eq!([writer.left_y2], [false]);
+        writer.left_y2 = true;
+        writer.skip_macroblock(0, false);
+        assert_eq!([writer.left_y2], [false]);
+        assert_eq!(writer.above_y2, [true, false]);
     }
 }
