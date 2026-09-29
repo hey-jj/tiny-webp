@@ -7,6 +7,7 @@ use crate::quantize::BIT_COST;
 const PLANE_Y_AFTER_Y2: usize = 0;
 const PLANE_Y2: usize = 1;
 const PLANE_CHROMA: usize = 2;
+const PLANE_Y_WITHOUT_Y2: usize = 3;
 const BAND_COUNT: usize = 8;
 const CONTEXT_COUNT: usize = 3;
 const TREE_NODE_COUNT: usize = 11;
@@ -451,6 +452,7 @@ impl ResidualWriter {
         encoder: &mut W,
         macroblock_x: usize,
         residual: &MacroblockResidual,
+        has_y2: bool,
     ) {
         if macroblock_x == 0 {
             self.left_y = [false; 4];
@@ -459,10 +461,13 @@ impl ResidualWriter {
             self.left_y2 = false;
         }
 
-        let y2_context = usize::from(self.left_y2) + usize::from(self.above_y2[macroblock_x]);
-        let y2_has_coefficients = write_block(encoder, &residual.y2, PLANE_Y2, 0, y2_context);
-        self.left_y2 = y2_has_coefficients;
-        self.above_y2[macroblock_x] = y2_has_coefficients;
+        // RFC 6386 section 13.3 retains the nearest Y2 context across B_PRED blocks.
+        if has_y2 {
+            let y2_context = usize::from(self.left_y2) + usize::from(self.above_y2[macroblock_x]);
+            let y2_has_coefficients = write_block(encoder, &residual.y2, PLANE_Y2, 0, y2_context);
+            self.left_y2 = y2_has_coefficients;
+            self.above_y2[macroblock_x] = y2_has_coefficients;
+        }
 
         write_plane_blocks(
             encoder,
@@ -472,8 +477,12 @@ impl ResidualWriter {
                 above: &mut self.above_y,
                 above_start: macroblock_x * 4,
                 left: &mut self.left_y,
-                plane: PLANE_Y_AFTER_Y2,
-                first_position: 1,
+                plane: if has_y2 {
+                    PLANE_Y_AFTER_Y2
+                } else {
+                    PLANE_Y_WITHOUT_Y2
+                },
+                first_position: usize::from(has_y2),
             },
         );
         write_plane_blocks(
@@ -727,6 +736,7 @@ mod tests {
             &mut self,
             decoder: &mut BoolDecoder<'_>,
             macroblock_x: usize,
+            has_y2: bool,
         ) -> MacroblockResidual {
             if macroblock_x == 0 {
                 self.left_y = [false; 4];
@@ -736,12 +746,15 @@ mod tests {
             }
 
             let mut residual = MacroblockResidual::default();
-            let y2_context = usize::from(self.left_y2) + usize::from(self.above_y2[macroblock_x]);
-            self.first_contexts_seen[y2_context] = true;
-            let (y2, y2_has_coefficients) = read_block(decoder, PLANE_Y2, 0, y2_context);
-            residual.y2 = y2;
-            self.left_y2 = y2_has_coefficients;
-            self.above_y2[macroblock_x] = y2_has_coefficients;
+            if has_y2 {
+                let y2_context =
+                    usize::from(self.left_y2) + usize::from(self.above_y2[macroblock_x]);
+                self.first_contexts_seen[y2_context] = true;
+                let (y2, y2_has_coefficients) = read_block(decoder, PLANE_Y2, 0, y2_context);
+                residual.y2 = y2;
+                self.left_y2 = y2_has_coefficients;
+                self.above_y2[macroblock_x] = y2_has_coefficients;
+            }
 
             read_plane_blocks(
                 decoder,
@@ -752,8 +765,12 @@ mod tests {
                     above: &mut self.above_y,
                     above_start: macroblock_x * 4,
                     left: &mut self.left_y,
-                    plane: PLANE_Y_AFTER_Y2,
-                    first_position: 1,
+                    plane: if has_y2 {
+                        PLANE_Y_AFTER_Y2
+                    } else {
+                        PLANE_Y_WITHOUT_Y2
+                    },
+                    first_position: usize::from(has_y2),
                 },
             );
             read_plane_blocks(
@@ -1115,7 +1132,7 @@ mod tests {
         let mut writer = ResidualWriter::new(COLUMNS);
         let mut states = Vec::with_capacity(MACROBLOCKS);
         for (index, residual) in expected.iter().enumerate() {
-            writer.write_macroblock(&mut encoder, index % COLUMNS, residual);
+            writer.write_macroblock(&mut encoder, index % COLUMNS, residual, true);
             states.push(ContextState::from(&writer));
         }
 
@@ -1123,7 +1140,7 @@ mod tests {
         let mut decoder = BoolDecoder::new(&encoded);
         let mut reader = ResidualReader::new(COLUMNS);
         for (index, residual) in expected.iter().enumerate() {
-            let decoded = reader.read_macroblock(&mut decoder, index % COLUMNS);
+            let decoded = reader.read_macroblock(&mut decoder, index % COLUMNS, true);
             assert_eq!(decoded, *residual, "macroblock {index}");
             assert_eq!(
                 reader.state(),
@@ -1132,6 +1149,61 @@ mod tests {
             );
         }
         assert_eq!(reader.first_contexts_seen, [true; 3]);
+    }
+
+    #[test]
+    fn mixed_luma_records_round_trip_dc_levels_and_retain_the_nearest_y2_context() {
+        let mut seed = 0x683a_97d1;
+        let mut encoder = BoolEncoder::new();
+        let mut writer = ResidualWriter::new(5);
+        let mut records = Vec::new();
+        for index in 0..100 {
+            let has_y2 = index % 3 == 0;
+            let mut residual = seeded_macroblock(&mut seed);
+            if !has_y2 {
+                residual.y2 = [0; 16];
+                for (block, levels) in residual.y.iter_mut().enumerate() {
+                    levels[0] = if block % 2 == 0 { 7 } else { -3 };
+                }
+            }
+            let previous = ContextState::from(&writer);
+            writer.write_macroblock(&mut encoder, index % 5, &residual, has_y2);
+            if !has_y2 {
+                assert_eq!(writer.above_y2, previous.above_y2);
+                assert_eq!(writer.left_y2, index % 5 != 0 && previous.left_y2);
+            }
+            records.push((residual, has_y2, ContextState::from(&writer)));
+        }
+        let bytes = encoder.finish();
+        let mut decoder = BoolDecoder::new(&bytes);
+        let mut reader = ResidualReader::new(5);
+        for (index, (expected, has_y2, state)) in records.iter().enumerate() {
+            let decoded = reader.read_macroblock(&mut decoder, index % 5, *has_y2);
+            assert_eq!(decoded, *expected, "macroblock {index}");
+            assert_eq!(reader.state(), *state, "macroblock {index}");
+        }
+        assert_eq!(reader.first_contexts_seen, [true; 3]);
+    }
+
+    #[test]
+    fn subblock_luma_codes_its_dc_at_type_three_and_position_zero() {
+        let mut trace = TraceWriter::default();
+        let mut levels = [0; 16];
+        levels[0] = -1;
+        assert!(
+            write_block(&mut trace, &levels, PLANE_Y_WITHOUT_Y2, 0, 0),
+            "the coded DC makes the block nonempty",
+        );
+        assert_eq!(
+            trace.writes,
+            [
+                (202, true),
+                (24, true),
+                (213, false),
+                (128, true),
+                (166, false)
+            ]
+        );
     }
 
     #[test]
@@ -1244,7 +1316,12 @@ mod tests {
         let mut writer = ResidualWriter::new(2);
         for column in [0, 1, 0] {
             let stored = reader.next_macroblock().unwrap();
-            writer.write_macroblock(&mut statistics.writer(&mut trace), column, &stored.residual);
+            writer.write_macroblock(
+                &mut statistics.writer(&mut trace),
+                column,
+                &stored.residual,
+                true,
+            );
         }
         let mut expected = [[0; 2]; COEFF_PROB_COUNT];
         let mut set = |plane: usize, band: usize, context: usize, node: usize, counts| {
@@ -1283,7 +1360,7 @@ mod tests {
         let mut direct = ResidualWriter::new(5);
         let mut expected = TraceWriter::default();
         for (index, block) in blocks.iter().enumerate() {
-            direct.write_macroblock(&mut expected, index % 5, &block.residual);
+            direct.write_macroblock(&mut expected, index % 5, &block.residual, true);
             stream.push(block);
         }
         assert_eq!(stream.bytes.capacity(), capacity);
@@ -1298,6 +1375,7 @@ mod tests {
                 &mut statistics.writer(&mut actual),
                 index % 5,
                 &block.residual,
+                true,
             );
         }
         assert_eq!(actual.writes, expected.writes);

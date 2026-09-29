@@ -3,7 +3,7 @@ use alloc::vec::Vec;
 
 use crate::bool_coder::BoolEncoder;
 use crate::color::{convert, YuvPlanes};
-use crate::prediction::{predict_chroma, predict_luma};
+use crate::prediction::{predict_chroma, predict_luma, CANDIDATES};
 use crate::quantize::{dequantize_block, factors, quantize_block, QuantizationFactors};
 use crate::residual::{
     MacroblockResidual, ResidualWriter, TokenMacroblock, TokenStatistics, TokenStream,
@@ -12,7 +12,6 @@ use crate::residual::{
 use crate::transform::{clamped_add, forward_dct, forward_wht, inverse_dct, inverse_wht};
 use crate::{Alpha, Filter, Options};
 
-const DC_MODE: u8 = 0;
 const SUBBLOCK_MODE: u8 = 4;
 
 // RFC 6386 section 11.2 defines the key-frame luma mode tree and probabilities.
@@ -166,6 +165,26 @@ pub(crate) fn encode(
     quantizer_index: u8,
     options: &Options,
 ) -> EncodedFrame {
+    encode_with_decision(
+        pixels,
+        width,
+        height,
+        bytes_per_pixel,
+        quantizer_index,
+        options,
+        ModeDecision::default(),
+    )
+}
+
+fn encode_with_decision(
+    pixels: &[u8],
+    width: usize,
+    height: usize,
+    bytes_per_pixel: usize,
+    quantizer_index: u8,
+    options: &Options,
+    decision: ModeDecision,
+) -> EncodedFrame {
     let source = convert(pixels, width, height, bytes_per_pixel);
     let macroblock_columns = width.div_ceil(16);
     let macroblock_rows = height.div_ceil(16);
@@ -188,59 +207,14 @@ pub(crate) fn encode(
     write_frame_header(&mut first_partition, quantizer_index, options.filter);
     for macroblock_y in 0..macroblock_rows {
         for macroblock_x in 0..macroblock_columns {
-            let luma_prediction = predict_luma(
-                &reconstruction.y,
-                reconstruction.y_stride,
-                macroblock_x,
-                macroblock_y,
-            );
-            let u_prediction = predict_chroma(
-                &reconstruction.u,
-                reconstruction.chroma_stride,
-                macroblock_x,
-                macroblock_y,
-            );
-            let v_prediction = predict_chroma(
-                &reconstruction.v,
-                reconstruction.chroma_stride,
-                macroblock_x,
-                macroblock_y,
-            );
-            let mut residual = MacroblockResidual::default();
-            analyze_luma(
-                &source.y,
-                &luma_prediction,
-                &mut reconstruction.y,
-                source.y_stride,
+            let selected = decision.analyze(
+                &source,
+                &mut reconstruction,
                 (macroblock_x, macroblock_y),
                 quantization,
-                &mut residual,
-            );
-            analyze_chroma(
-                &source.u,
-                &u_prediction,
-                &mut reconstruction.u,
-                source.chroma_stride,
-                (macroblock_x, macroblock_y),
-                quantization,
-                &mut residual.u,
-            );
-            analyze_chroma(
-                &source.v,
-                &v_prediction,
-                &mut reconstruction.v,
-                source.chroma_stride,
-                (macroblock_x, macroblock_y),
-                quantization,
-                &mut residual.v,
             );
             tokens.clear();
-            tokens.push(&TokenMacroblock {
-                luma_mode: DC_MODE,
-                chroma_mode: DC_MODE,
-                subblock_modes: [0; 16],
-                residual,
-            });
+            tokens.push(&selected);
             let stored = tokens
                 .reader()
                 .next_macroblock()
@@ -252,11 +226,12 @@ pub(crate) fn encode(
                 stored.chroma_mode,
                 &stored.subblock_modes,
             );
-            statistics.record_macroblock(&stored.residual, true);
+            statistics.record_macroblock(&stored.residual, stored.luma_mode != SUBBLOCK_MODE);
             residual_writer.write_macroblock(
                 &mut statistics.writer(&mut second_partition),
                 macroblock_x,
                 &stored.residual,
+                stored.luma_mode != SUBBLOCK_MODE,
             );
         }
     }
@@ -388,6 +363,276 @@ impl ModeWriter {
 fn derived_subblock_mode(luma_mode: u8) -> u8 {
     // RFC 6386 section 11.3 maps each whole-block mode to a sub-block context.
     [0, 2, 3, 1][usize::from(luma_mode)]
+}
+
+struct ModeDecision {
+    early_exit: bool,
+}
+
+impl Default for ModeDecision {
+    fn default() -> Self {
+        Self { early_exit: true }
+    }
+}
+
+impl ModeDecision {
+    #[cfg(test)]
+    fn set_early_exit(&mut self, enabled: bool) {
+        self.early_exit = enabled;
+    }
+
+    fn finished(&self, distortion: u64) -> bool {
+        // Each squared sample difference is at least zero, so their sum is at least zero.
+        self.early_exit && distortion == 0
+    }
+
+    fn analyze(
+        &self,
+        source: &YuvPlanes,
+        reconstruction: &mut YuvPlanes,
+        macroblock: (usize, usize),
+        quantization: QuantizationFactors,
+    ) -> TokenMacroblock {
+        let mut selected = TokenMacroblock::default();
+        let mut best_distortion = u64::MAX;
+        let mut best_luma = [0; 256];
+        for (mode, &candidate) in CANDIDATES[..4].iter().enumerate() {
+            let prediction = predict_luma(
+                &reconstruction.y,
+                source.y_stride,
+                macroblock.0,
+                macroblock.1,
+                candidate,
+            );
+            let mut residual = MacroblockResidual::default();
+            analyze_luma(
+                &source.y,
+                &prediction,
+                &mut reconstruction.y,
+                source.y_stride,
+                macroblock,
+                quantization,
+                &mut residual,
+            );
+            let distortion =
+                block_distortion::<16>(&source.y, &reconstruction.y, source.y_stride, macroblock);
+            if distortion < best_distortion {
+                best_distortion = distortion;
+                selected.luma_mode = mode as u8;
+                selected.residual = residual;
+                copy_macroblock::<16>(
+                    &reconstruction.y,
+                    source.y_stride,
+                    macroblock,
+                    &mut best_luma,
+                );
+            }
+            if self.finished(best_distortion) {
+                break;
+            }
+        }
+        if !self.finished(best_distortion) {
+            let mut candidate = TokenMacroblock {
+                luma_mode: SUBBLOCK_MODE,
+                ..TokenMacroblock::default()
+            };
+            let distortion = self.analyze_subblocks(
+                source,
+                reconstruction,
+                macroblock,
+                quantization,
+                &mut candidate,
+            );
+            if distortion < best_distortion {
+                selected = candidate;
+                copy_macroblock::<16>(
+                    &reconstruction.y,
+                    source.y_stride,
+                    macroblock,
+                    &mut best_luma,
+                );
+            }
+        }
+        restore_macroblock::<16>(
+            &mut reconstruction.y,
+            source.y_stride,
+            macroblock,
+            &best_luma,
+        );
+
+        let mut best_distortion = u64::MAX;
+        let mut best_u = [0; 64];
+        let mut best_v = [0; 64];
+        for (mode, &candidate) in CANDIDATES[..4].iter().enumerate() {
+            let mut residual = MacroblockResidual::default();
+            for (input, output, levels) in [
+                (&source.u, &mut reconstruction.u, &mut residual.u),
+                (&source.v, &mut reconstruction.v, &mut residual.v),
+            ] {
+                let prediction = predict_chroma(
+                    output,
+                    source.chroma_stride,
+                    macroblock.0,
+                    macroblock.1,
+                    candidate,
+                );
+                analyze_chroma(
+                    input,
+                    &prediction,
+                    output,
+                    source.chroma_stride,
+                    macroblock,
+                    quantization,
+                    levels,
+                );
+            }
+            let distortion = block_distortion::<8>(
+                &source.u,
+                &reconstruction.u,
+                source.chroma_stride,
+                macroblock,
+            ) + block_distortion::<8>(
+                &source.v,
+                &reconstruction.v,
+                source.chroma_stride,
+                macroblock,
+            );
+            if distortion < best_distortion {
+                best_distortion = distortion;
+                selected.chroma_mode = mode as u8;
+                selected.residual.u = residual.u;
+                selected.residual.v = residual.v;
+                copy_macroblock::<8>(
+                    &reconstruction.u,
+                    source.chroma_stride,
+                    macroblock,
+                    &mut best_u,
+                );
+                copy_macroblock::<8>(
+                    &reconstruction.v,
+                    source.chroma_stride,
+                    macroblock,
+                    &mut best_v,
+                );
+            }
+            if self.finished(best_distortion) {
+                break;
+            }
+        }
+        restore_macroblock::<8>(
+            &mut reconstruction.u,
+            source.chroma_stride,
+            macroblock,
+            &best_u,
+        );
+        restore_macroblock::<8>(
+            &mut reconstruction.v,
+            source.chroma_stride,
+            macroblock,
+            &best_v,
+        );
+        selected
+    }
+
+    fn analyze_subblocks(
+        &self,
+        source: &YuvPlanes,
+        reconstruction: &mut YuvPlanes,
+        macroblock: (usize, usize),
+        quantization: QuantizationFactors,
+        selected: &mut TokenMacroblock,
+    ) -> u64 {
+        let mut total = 0;
+        for block in 0..16 {
+            let x = macroblock.0 * 16 + block % 4 * 4;
+            let y = macroblock.1 * 16 + block / 4 * 4;
+            let mut best_distortion = u64::MAX;
+            let mut best_pixels = [0; 16];
+            for (mode, candidate) in CANDIDATES[4..].iter().enumerate() {
+                let mut prediction = [0; 16];
+                candidate.predict::<4>(&reconstruction.y, source.y_stride, x, y, &mut prediction);
+                let samples =
+                    residual_block(&source.y, source.y_stride, (x, y), &prediction, 4, (0, 0));
+                let levels =
+                    quantize_block(&forward_dct(&samples), quantization.y_dc, quantization.y_ac);
+                let coefficients = dequantize_block(&levels, quantization.y_dc, quantization.y_ac);
+                let residual = inverse_dct(&coefficients);
+                let pixels = core::array::from_fn::<_, 16, _>(|position| {
+                    clamped_add(prediction[position], residual[position])
+                });
+                let distortion = pixels
+                    .iter()
+                    .enumerate()
+                    .map(|(position, &pixel)| {
+                        let difference = i32::from(
+                            source.y[(y + position / 4) * source.y_stride + x + position % 4],
+                        ) - i32::from(pixel);
+                        (difference * difference) as u64
+                    })
+                    .sum();
+                if distortion < best_distortion {
+                    best_distortion = distortion;
+                    best_pixels = pixels;
+                    selected.subblock_modes[block] = mode as u8;
+                    selected.residual.y[block] = levels;
+                }
+                if self.finished(best_distortion) {
+                    break;
+                }
+            }
+            // RFC 6386 section 12.3 predicts each sub-block from reconstructed neighbors.
+            restore_macroblock::<4>(
+                &mut reconstruction.y,
+                source.y_stride,
+                (x / 4, y / 4),
+                &best_pixels,
+            );
+            total += best_distortion;
+        }
+        total
+    }
+}
+
+fn block_distortion<const SIDE: usize>(
+    source: &[u8],
+    reconstruction: &[u8],
+    stride: usize,
+    macroblock: (usize, usize),
+) -> u64 {
+    let mut distortion = 0;
+    for row in 0..SIDE {
+        let offset = (macroblock.1 * SIDE + row) * stride + macroblock.0 * SIDE;
+        for column in 0..SIDE {
+            let difference =
+                i32::from(source[offset + column]) - i32::from(reconstruction[offset + column]);
+            distortion += (difference * difference) as u64;
+        }
+    }
+    distortion
+}
+
+fn copy_macroblock<const SIDE: usize>(
+    plane: &[u8],
+    stride: usize,
+    macroblock: (usize, usize),
+    output: &mut [u8],
+) {
+    for row in 0..SIDE {
+        let offset = (macroblock.1 * SIDE + row) * stride + macroblock.0 * SIDE;
+        output[row * SIDE..(row + 1) * SIDE].copy_from_slice(&plane[offset..offset + SIDE]);
+    }
+}
+
+fn restore_macroblock<const SIDE: usize>(
+    plane: &mut [u8],
+    stride: usize,
+    macroblock: (usize, usize),
+    pixels: &[u8],
+) {
+    for row in 0..SIDE {
+        let offset = (macroblock.1 * SIDE + row) * stride + macroblock.0 * SIDE;
+        plane[offset..offset + SIDE].copy_from_slice(&pixels[row * SIDE..(row + 1) * SIDE]);
+    }
 }
 
 fn analyze_luma(
@@ -625,8 +870,7 @@ fn assemble_riff(
 #[cfg(test)]
 mod tests {
     use super::{
-        encode, write_frame_header, DC_MODE, KF_UV_MODE_PROBS, KF_Y_MODE_PROBS, KF_Y_MODE_TREE,
-        UV_MODE_TREE,
+        encode, write_frame_header, KF_UV_MODE_PROBS, KF_Y_MODE_PROBS, KF_Y_MODE_TREE, UV_MODE_TREE,
     };
     use crate::bool_coder::BoolEncoder;
     use crate::generator;
@@ -845,7 +1089,7 @@ mod tests {
     }
 
     #[test]
-    fn an_opaque_file_carries_one_padded_vp8_chunk_with_the_frame_fields() {
+    fn an_opaque_file_carries_one_vp8_chunk_with_the_frame_fields() {
         let pixels = [
             0, 32, 64, 96, 128, 160, 192, 224, 255, 17, 34, 51, 68, 85, 102, 119, 136, 153,
         ];
@@ -868,11 +1112,11 @@ mod tests {
         assert_eq!(&encoded[8..12], b"WEBP");
         assert_eq!(&encoded[12..16], b"VP8 ");
         assert_eq!(encoded.len(), 20 + chunk_size + (chunk_size & 1));
-        assert_eq!(encoded.get(20 + chunk_size), Some(&0));
+        assert_eq!(encoded.get(20 + chunk_size), None);
         assert_eq!(frame_tag & 1, 0);
         assert_eq!((frame_tag >> 1) & 7, 0);
         assert_eq!((frame_tag >> 4) & 1, 1);
-        assert_eq!(first_partition_size, 7);
+        assert_eq!(first_partition_size, 11);
         assert_eq!(&payload[3..6], &[0x9d, 0x01, 0x2a]);
         assert_eq!(u16::from_le_bytes([payload[6], payload[7]]), 3);
         assert_eq!(u16::from_le_bytes([payload[8], payload[9]]), 2);
@@ -895,8 +1139,10 @@ mod tests {
             assert_eq!(u8::from(header.read_bool(probability)), 0);
         }
         assert_eq!(header.read_literal(1), 0);
-        assert_eq!(header.read_tree(&KF_Y_MODE_TREE, &KF_Y_MODE_PROBS, 0), 0);
-        assert_eq!(header.read_tree(&UV_MODE_TREE, &KF_UV_MODE_PROBS, 0), 0);
+        assert_eq!(
+            read_frame_modes(&encoded, 1, 1),
+            [(4, 2, [1, 3, 1, 1, 2, 1, 0, 0, 2, 0, 0, 0, 1, 0, 0, 0])],
+        );
     }
 
     #[test]
@@ -975,8 +1221,8 @@ mod tests {
         let mut partition = BoolEncoder::with_capacity(524_288);
         write_frame_header(&mut partition, 0, Filter::Off);
         for _ in 0..macroblock_count {
-            partition.write_tree(&KF_Y_MODE_TREE, &KF_Y_MODE_PROBS, DC_MODE, 0);
-            partition.write_tree(&UV_MODE_TREE, &KF_UV_MODE_PROBS, DC_MODE, 0);
+            partition.write_tree(&KF_Y_MODE_TREE, &KF_Y_MODE_PROBS, 0, 0);
+            partition.write_tree(&UV_MODE_TREE, &KF_UV_MODE_PROBS, 0, 0);
         }
         let partition_size = partition.finish().len();
         assert_eq!(partition_size, 449_397);
@@ -1295,6 +1541,245 @@ mod tests {
         fs::remove_dir_all(directory).expect("remove the test directory");
     }
 
+    #[test]
+    fn mode_decision_minimizes_reconstruction_error_for_luma_and_joint_chroma() {
+        let source = crate::color::YuvPlanes {
+            y: (0..1024)
+                .map(|i| (16 + (37 * i + i / 32 * 11) % 220) as u8)
+                .collect(),
+            u: (0..256)
+                .map(|i| (16 + (23 * i + i / 16 * 7) % 225) as u8)
+                .collect(),
+            v: (0..256)
+                .map(|i| (16 + (41 * i + i / 16 * 13) % 225) as u8)
+                .collect(),
+            y_stride: 32,
+            chroma_stride: 16,
+        };
+        let mut reconstruction = crate::color::YuvPlanes {
+            y: (0..1024).map(|i| (i * 19 % 256) as u8).collect(),
+            u: (0..256).map(|i| (i * 31 % 256) as u8).collect(),
+            v: (0..256).map(|i| (i * 53 % 256) as u8).collect(),
+            y_stride: 32,
+            chroma_stride: 16,
+        };
+        let quantization = factors(57);
+        let mut luma_scores = [0; 5];
+        let mut u_scores = [0; 4];
+        let mut v_scores = [0; 4];
+        for (mode, &candidate) in crate::prediction::CANDIDATES[..4].iter().enumerate() {
+            let prediction =
+                crate::prediction::predict_luma(&reconstruction.y, 32, 1, 1, candidate);
+            let mut residual = crate::residual::MacroblockResidual::default();
+            super::analyze_luma(
+                &source.y,
+                &prediction,
+                &mut reconstruction.y,
+                32,
+                (1, 1),
+                quantization,
+                &mut residual,
+            );
+            luma_scores[mode] =
+                super::block_distortion::<16>(&source.y, &reconstruction.y, 32, (1, 1));
+            for (input, output, scores) in [
+                (&source.u, &mut reconstruction.u, &mut u_scores),
+                (&source.v, &mut reconstruction.v, &mut v_scores),
+            ] {
+                let prediction = crate::prediction::predict_chroma(output, 16, 1, 1, candidate);
+                super::analyze_chroma(
+                    input,
+                    &prediction,
+                    output,
+                    16,
+                    (1, 1),
+                    quantization,
+                    &mut [[0; 16]; 4],
+                );
+                scores[mode] = super::block_distortion::<8>(input, output, 16, (1, 1));
+            }
+        }
+        let decision = super::ModeDecision::default();
+        luma_scores[4] = decision.analyze_subblocks(
+            &source,
+            &mut reconstruction,
+            (1, 1),
+            quantization,
+            &mut crate::residual::TokenMacroblock::default(),
+        );
+        let selected = decision.analyze(&source, &mut reconstruction, (1, 1), quantization);
+        assert_eq!(luma_scores, [16861, 16709, 17237, 19288, 13603]);
+        assert_eq!(u_scores, [4623, 4659, 3760, 5017]);
+        assert_eq!(v_scores, [2526, 1695, 3472, 5738]);
+        assert_eq!((selected.luma_mode, selected.chroma_mode), (4, 1));
+        assert_eq!(
+            super::block_distortion::<16>(&source.y, &reconstruction.y, 32, (1, 1)),
+            *luma_scores.iter().min().unwrap()
+        );
+        let chroma_scores = core::array::from_fn::<_, 4, _>(|mode| u_scores[mode] + v_scores[mode]);
+        assert_eq!(
+            super::block_distortion::<8>(&source.u, &reconstruction.u, 16, (1, 1))
+                + super::block_distortion::<8>(&source.v, &reconstruction.v, 16, (1, 1)),
+            *chroma_scores.iter().min().unwrap(),
+        );
+    }
+
+    #[test]
+    fn zero_distortion_ties_keep_dc_with_either_early_exit_setting() {
+        for early_exit in [true, false] {
+            let source = crate::color::YuvPlanes {
+                y: vec![128; 256],
+                u: vec![128; 64],
+                v: vec![128; 64],
+                y_stride: 16,
+                chroma_stride: 8,
+            };
+            let mut reconstruction = crate::color::YuvPlanes {
+                y: vec![0; 256],
+                u: vec![0; 64],
+                v: vec![0; 64],
+                y_stride: 16,
+                chroma_stride: 8,
+            };
+            let mut decision = super::ModeDecision::default();
+            decision.set_early_exit(early_exit);
+            let selected = decision.analyze(&source, &mut reconstruction, (0, 0), factors(0));
+            assert_eq!(selected, crate::residual::TokenMacroblock::default());
+            assert_eq!(reconstruction.y, [128; 256]);
+            assert_eq!(reconstruction.u, [128; 64]);
+            assert_eq!(reconstruction.v, [128; 64]);
+        }
+    }
+
+    #[test]
+    fn early_exits_preserve_fixture_digests_at_every_fixed_quality_and_entry_point() {
+        use sha2::{Digest, Sha256};
+        for fixture in generator::all() {
+            let rgb = rgb_bytes(&fixture.rgba);
+            for quality in [0u8, 25, 50, 75, 90, 95, 100] {
+                let options = Options {
+                    quality,
+                    filter: Filter::Off,
+                    ..Options::default()
+                };
+                for (pixels, bytes_per_pixel) in [(&fixture.rgba, 4), (&rgb, 3)] {
+                    let mut exhaustive = super::ModeDecision::default();
+                    exhaustive.set_early_exit(false);
+                    let expected = super::encode_with_decision(
+                        pixels,
+                        fixture.width as usize,
+                        fixture.height as usize,
+                        bytes_per_pixel,
+                        quantizer_index(quality),
+                        &options,
+                        exhaustive,
+                    );
+                    let actual = encode(
+                        pixels,
+                        fixture.width as usize,
+                        fixture.height as usize,
+                        bytes_per_pixel,
+                        quantizer_index(quality),
+                        &options,
+                    );
+                    assert_eq!(
+                        Sha256::digest(&actual.webp),
+                        Sha256::digest(&expected.webp),
+                        "{} q{quality} channels {bytes_per_pixel}",
+                        fixture.name,
+                    );
+                    assert_eq!(actual.reconstruction.y, expected.reconstruction.y);
+                    assert_eq!(actual.reconstruction.u, expected.reconstruction.u);
+                    assert_eq!(actual.reconstruction.v, expected.reconstruction.v);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn diagonals_codes_four_distinct_subblock_modes_in_one_macroblock() {
+        let fixtures = generator::all();
+        let fixture = fixtures
+            .iter()
+            .find(|fixture| fixture.name == "diagonals")
+            .unwrap();
+        let encoded = encode(
+            &fixture.rgba,
+            fixture.width as usize,
+            fixture.height as usize,
+            4,
+            quantizer_index(75),
+            &Options::default(),
+        );
+        let modes = read_frame_modes(&encoded.webp, 3, 3);
+        let distinct: Vec<_> = modes
+            .iter()
+            .filter(|(mode, _, _)| *mode == 4)
+            .map(|(_, _, blocks)| {
+                blocks
+                    .iter()
+                    .fold(0u16, |mask, &mode| mask | 1 << mode)
+                    .count_ones()
+            })
+            .collect();
+        assert_eq!(distinct, [5, 3, 4, 4, 4]);
+        assert_eq!(
+            modes[0],
+            (4, 0, [1, 2, 0, 0, 3, 3, 2, 0, 1, 3, 3, 6, 1, 0, 3, 3])
+        );
+    }
+
+    fn read_frame_modes(webp: &[u8], columns: usize, rows: usize) -> Vec<(u8, u8, [u8; 16])> {
+        let mut decoder = crate::bool_coder::BoolDecoder::new(&webp[30..]);
+        for width in [1, 1, 1, 1, 6, 3, 1, 2] {
+            assert_eq!(decoder.read_literal(width), 0);
+        }
+        decoder.read_literal(7);
+        for _ in 0..5 {
+            assert_eq!(decoder.read_literal(1), 0);
+        }
+        assert_eq!(decoder.read_literal(1), 1);
+        for probability in crate::residual::COEFF_UPDATE_PROBS {
+            assert!(
+                !decoder.read_bool(probability),
+                "the frame keeps default probabilities"
+            );
+        }
+        assert_eq!(decoder.read_literal(1), 0);
+        let mut blocks = vec![0usize; columns * rows * 16];
+        let mut result = Vec::new();
+        for row in 0..rows {
+            for column in 0..columns {
+                let luma = decoder.read_tree(&KF_Y_MODE_TREE, &KF_Y_MODE_PROBS, 0);
+                let mut modes = [0; 16];
+                for (block, mode) in modes.iter_mut().enumerate() {
+                    let x = column * 4 + block % 4;
+                    let y = row * 4 + block / 4;
+                    let position = y * columns * 4 + x;
+                    if luma == 4 {
+                        let above = if y == 0 {
+                            0
+                        } else {
+                            blocks[position - columns * 4]
+                        };
+                        let left = if x == 0 { 0 } else { blocks[position - 1] };
+                        *mode = decoder.read_tree(
+                            &super::B_MODE_TREE,
+                            &super::KF_B_MODE_PROBS[above][left],
+                            0,
+                        );
+                    } else {
+                        *mode = [0, 2, 3, 1][usize::from(luma)];
+                    }
+                    blocks[position] = usize::from(*mode);
+                }
+                let chroma = decoder.read_tree(&UV_MODE_TREE, &KF_UV_MODE_PROBS, 0);
+                result.push((luma, chroma, modes));
+            }
+        }
+        result
+    }
+
     fn alpha_bytes(rgba: &[u8]) -> Vec<u8> {
         rgba[3..].iter().step_by(4).copied().collect()
     }
@@ -1467,6 +1952,20 @@ mod tests {
         index: u8,
         encoded: &super::EncodedFrame,
     ) {
+        let mut decoder = image_webp::WebPDecoder::new(Cursor::new(&encoded.webp))
+            .expect("decode the fixture header");
+        assert_eq!(decoder.dimensions(), (fixture.width, fixture.height));
+        let alpha = has_nonopaque_alpha(&fixture.rgba);
+        assert_eq!(decoder.has_alpha(), alpha);
+        let channels = if alpha { 4 } else { 3 };
+        let mut pixels = vec![0; fixture.width as usize * fixture.height as usize * channels];
+        decoder
+            .read_image(&mut pixels)
+            .expect("decode the fixture pixels");
+        if alpha {
+            assert_eq!(alpha_bytes(&pixels), alpha_bytes(&fixture.rgba));
+        }
+        let png = directory.join("dimensions.png");
         let input = directory.join("input.webp");
         let output = directory.join("output.yuv");
         fs::write(&input, &encoded.webp).expect("write the WebP file");
@@ -1483,6 +1982,15 @@ mod tests {
             "fixture {}, quantizer index {index}",
             fixture.name
         );
+        let status = Command::new("dwebp")
+            .arg("-quiet")
+            .arg(&input)
+            .arg("-o")
+            .arg(&png)
+            .status()
+            .expect("decode the fixture to PNG");
+        assert_eq!(status.code(), Some(0));
+        assert_eq!(png_dimensions(&png), (fixture.width, fixture.height));
         let decoded = fs::read(output).expect("read the decoded YUV planes");
         let width = fixture.width as usize;
         let height = fixture.height as usize;

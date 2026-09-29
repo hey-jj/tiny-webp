@@ -24,72 +24,25 @@ pub(crate) enum SubblockMode {
     HorizontalUp,
 }
 
-pub(crate) struct Candidate {
-    pub(crate) mode: PredictionMode,
-    pub(crate) enabled: bool,
-}
-
-pub(crate) const CANDIDATES: [Candidate; 14] = [
-    Candidate {
-        mode: PredictionMode::Dc,
-        enabled: true,
-    },
-    Candidate {
-        mode: PredictionMode::Vertical,
-        enabled: false,
-    },
-    Candidate {
-        mode: PredictionMode::Horizontal,
-        enabled: false,
-    },
-    Candidate {
-        mode: PredictionMode::TrueMotion,
-        enabled: false,
-    },
-    Candidate {
-        mode: PredictionMode::Subblock(SubblockMode::Dc),
-        enabled: false,
-    },
-    Candidate {
-        mode: PredictionMode::Subblock(SubblockMode::TrueMotion),
-        enabled: false,
-    },
-    Candidate {
-        mode: PredictionMode::Subblock(SubblockMode::VerticalEdge),
-        enabled: false,
-    },
-    Candidate {
-        mode: PredictionMode::Subblock(SubblockMode::HorizontalEdge),
-        enabled: false,
-    },
-    Candidate {
-        mode: PredictionMode::Subblock(SubblockMode::LeftDown),
-        enabled: false,
-    },
-    Candidate {
-        mode: PredictionMode::Subblock(SubblockMode::RightDown),
-        enabled: false,
-    },
-    Candidate {
-        mode: PredictionMode::Subblock(SubblockMode::VerticalRight),
-        enabled: false,
-    },
-    Candidate {
-        mode: PredictionMode::Subblock(SubblockMode::VerticalLeft),
-        enabled: false,
-    },
-    Candidate {
-        mode: PredictionMode::Subblock(SubblockMode::HorizontalDown),
-        enabled: false,
-    },
-    Candidate {
-        mode: PredictionMode::Subblock(SubblockMode::HorizontalUp),
-        enabled: false,
-    },
+pub(crate) const CANDIDATES: [PredictionMode; 14] = [
+    PredictionMode::Dc,
+    PredictionMode::Vertical,
+    PredictionMode::Horizontal,
+    PredictionMode::TrueMotion,
+    PredictionMode::Subblock(SubblockMode::Dc),
+    PredictionMode::Subblock(SubblockMode::TrueMotion),
+    PredictionMode::Subblock(SubblockMode::VerticalEdge),
+    PredictionMode::Subblock(SubblockMode::HorizontalEdge),
+    PredictionMode::Subblock(SubblockMode::LeftDown),
+    PredictionMode::Subblock(SubblockMode::RightDown),
+    PredictionMode::Subblock(SubblockMode::VerticalRight),
+    PredictionMode::Subblock(SubblockMode::VerticalLeft),
+    PredictionMode::Subblock(SubblockMode::HorizontalDown),
+    PredictionMode::Subblock(SubblockMode::HorizontalUp),
 ];
 
 impl PredictionMode {
-    fn predict<const SIDE: usize>(
+    pub(crate) fn predict<const SIDE: usize>(
         self,
         reconstruction: &[u8],
         stride: usize,
@@ -259,17 +212,16 @@ pub(crate) fn predict_luma(
     stride: usize,
     macroblock_x: usize,
     macroblock_y: usize,
+    mode: PredictionMode,
 ) -> [u8; LUMA_SIDE * LUMA_SIDE] {
     let mut output = [0; LUMA_SIDE * LUMA_SIDE];
-    for candidate in CANDIDATES.iter().filter(|candidate| candidate.enabled) {
-        candidate.mode.predict::<LUMA_SIDE>(
-            reconstruction,
-            stride,
-            macroblock_x * LUMA_SIDE,
-            macroblock_y * LUMA_SIDE,
-            &mut output,
-        );
-    }
+    mode.predict::<LUMA_SIDE>(
+        reconstruction,
+        stride,
+        macroblock_x * LUMA_SIDE,
+        macroblock_y * LUMA_SIDE,
+        &mut output,
+    );
     output
 }
 
@@ -278,17 +230,16 @@ pub(crate) fn predict_chroma(
     stride: usize,
     macroblock_x: usize,
     macroblock_y: usize,
+    mode: PredictionMode,
 ) -> [u8; CHROMA_SIDE * CHROMA_SIDE] {
     let mut output = [0; CHROMA_SIDE * CHROMA_SIDE];
-    for candidate in CANDIDATES.iter().filter(|candidate| candidate.enabled) {
-        candidate.mode.predict::<CHROMA_SIDE>(
-            reconstruction,
-            stride,
-            macroblock_x * CHROMA_SIDE,
-            macroblock_y * CHROMA_SIDE,
-            &mut output,
-        );
-    }
+    mode.predict::<CHROMA_SIDE>(
+        reconstruction,
+        stride,
+        macroblock_x * CHROMA_SIDE,
+        macroblock_y * CHROMA_SIDE,
+        &mut output,
+    );
     output
 }
 
@@ -340,8 +291,14 @@ mod tests {
         let luma = vec![19; 16 * 16];
         let chroma = vec![37; 8 * 8];
 
-        assert_eq!(predict_luma(&luma, 16, 0, 0), [128; 16 * 16]);
-        assert_eq!(predict_chroma(&chroma, 8, 0, 0), [128; 8 * 8]);
+        assert_eq!(
+            predict_luma(&luma, 16, 0, 0, PredictionMode::Dc),
+            [128; 16 * 16]
+        );
+        assert_eq!(
+            predict_chroma(&chroma, 8, 0, 0, PredictionMode::Dc),
+            [128; 8 * 8]
+        );
     }
 
     #[test]
@@ -355,8 +312,14 @@ mod tests {
             chroma[row * 16 + 7] = if row < 4 { 20 } else { 21 };
         }
 
-        assert_eq!(predict_luma(&luma, 32, 1, 0), [11; 16 * 16]);
-        assert_eq!(predict_chroma(&chroma, 16, 1, 0), [21; 8 * 8]);
+        assert_eq!(
+            predict_luma(&luma, 32, 1, 0, PredictionMode::Dc),
+            [11; 16 * 16]
+        );
+        assert_eq!(
+            predict_chroma(&chroma, 16, 1, 0, PredictionMode::Dc),
+            [21; 8 * 8]
+        );
     }
 
     #[test]
@@ -370,8 +333,14 @@ mod tests {
             chroma[7 * 8 + column] = if column < 4 { 40 } else { 41 };
         }
 
-        assert_eq!(predict_luma(&luma, 16, 0, 1), [31; 16 * 16]);
-        assert_eq!(predict_chroma(&chroma, 8, 0, 1), [41; 8 * 8]);
+        assert_eq!(
+            predict_luma(&luma, 16, 0, 1, PredictionMode::Dc),
+            [31; 16 * 16]
+        );
+        assert_eq!(
+            predict_chroma(&chroma, 8, 0, 1, PredictionMode::Dc),
+            [41; 8 * 8]
+        );
     }
 
     #[test]
@@ -391,18 +360,33 @@ mod tests {
             chroma[row * 16 + 7] = 71;
         }
 
-        assert_eq!(predict_luma(&luma, 32, 1, 1), [61; 16 * 16]);
-        assert_eq!(predict_chroma(&chroma, 16, 1, 1), [71; 8 * 8]);
+        assert_eq!(
+            predict_luma(&luma, 32, 1, 1, PredictionMode::Dc),
+            [61; 16 * 16]
+        );
+        assert_eq!(
+            predict_chroma(&chroma, 16, 1, 1, PredictionMode::Dc),
+            [71; 8 * 8]
+        );
     }
 
     #[test]
-    fn only_the_full_block_dc_candidate_is_enabled() {
-        let enabled: std::vec::Vec<_> = CANDIDATES
-            .iter()
-            .filter(|candidate| candidate.enabled)
-            .map(|candidate| candidate.mode)
-            .collect();
-        assert_eq!(enabled, [PredictionMode::Dc]);
+    fn candidates_follow_the_full_block_and_subblock_enumeration_order() {
+        assert_eq!(
+            CANDIDATES[..4],
+            [
+                PredictionMode::Dc,
+                PredictionMode::Vertical,
+                PredictionMode::Horizontal,
+                PredictionMode::TrueMotion,
+            ]
+        );
+        for (index, candidate) in CANDIDATES[4..].iter().enumerate() {
+            let PredictionMode::Subblock(mode) = candidate else {
+                panic!("each remaining candidate has a sub-block mode");
+            };
+            assert_eq!(*mode as usize, index);
+        }
         assert_eq!(CANDIDATES.len(), 14);
     }
 
@@ -647,8 +631,8 @@ mod tests {
         let plane = vec![0; 16 * 16];
         let mut output = [0; 16];
         for candidate in &CANDIDATES[4..] {
-            candidate.mode.predict::<4>(&plane, 16, 0, 0, &mut output);
-            let expected = match candidate.mode {
+            candidate.predict::<4>(&plane, 16, 0, 0, &mut output);
+            let expected = match candidate {
                 PredictionMode::Subblock(SubblockMode::Dc) => [128; 16],
                 PredictionMode::Subblock(SubblockMode::TrueMotion | SubblockMode::HorizontalUp) => {
                     [129; 16]
@@ -665,7 +649,7 @@ mod tests {
                 ],
                 _ => [127; 16],
             };
-            assert_eq!(output, expected, "{:?}", candidate.mode);
+            assert_eq!(output, expected, "{:?}", candidate);
         }
     }
 }
