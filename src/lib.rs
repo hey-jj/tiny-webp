@@ -38,6 +38,9 @@ mod frame;
 #[path = "../fixtures/generator.rs"]
 mod generator;
 #[cfg(test)]
+#[path = "../tests/support/loop_filter.rs"]
+mod loop_filter;
+#[cfg(test)]
 #[path = "../fixtures/png_writer.rs"]
 mod png_writer;
 mod prediction;
