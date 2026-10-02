@@ -198,24 +198,56 @@ fn help_and_version_stop_parsing_when_the_parser_reaches_them() {
 }
 
 #[cfg(unix)]
-#[test]
-fn help_and_version_exit_one_with_one_problem_line_when_the_output_pipe_has_no_reader() {
+fn assert_help_and_version_fail_on_shutdown_stdout() {
+    use std::io::Read;
+    use std::net::Shutdown;
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+
     for flag in ["-h", "-version"] {
-        let (reader, writer) = std::io::pipe().expect("create the output pipe");
-        drop(reader);
+        let (mut reader, writer) = UnixStream::pair().expect("create the output socket");
+        writer.shutdown(Shutdown::Write).expect("shut down stdout");
         let output = command()
             .arg(flag)
-            .stdout(Stdio::from(writer))
+            .stdout(Stdio::from(OwnedFd::from(writer)))
             .output()
-            .expect("run the binary with an output pipe");
+            .expect("run the binary with shutdown stdout");
+        let mut stdout = Vec::new();
+        reader.read_to_end(&mut stdout).expect("read stdout");
         assert_eq!(output.status.code(), Some(1), "{flag}");
         assert_eq!(output.stdout, b"", "{flag}");
+        assert_eq!(stdout, b"", "{flag}");
         assert_eq!(
             output.stderr,
             b"tiny-webp: Could not write stdout. Check that standard output is writable.\n",
             "{flag}"
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn help_and_version_report_shutdown_stdout_across_500_serial_runs() {
+    for _ in 0..500 {
+        assert_help_and_version_fail_on_shutdown_stdout();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn help_and_version_report_shutdown_stdout_across_500_runs_with_eight_concurrent_spawners() {
+    let start = std::sync::Barrier::new(8);
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            let start = &start;
+            scope.spawn(move || {
+                start.wait();
+                for _ in 0..500 {
+                    assert_help_and_version_fail_on_shutdown_stdout();
+                }
+            });
+        }
+    });
 }
 
 #[test]
