@@ -13,7 +13,7 @@ use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-use tiny_webp::{Alpha, Options};
+use tiny_webp::{Alpha, Filter, Options};
 
 fn command() -> Command {
     Command::new(env!("CARGO_BIN_EXE_tiny-webp"))
@@ -131,12 +131,31 @@ fn flag_rows() -> Vec<(Vec<&'static str>, Options)> {
     q100.quality = 100;
     let mut noalpha = Options::default();
     noalpha.alpha = Alpha::Discard;
+    let mut filter_off = Options::default();
+    filter_off.filter = Filter::Level {
+        level: 0,
+        sharpness: 0,
+    };
+    let mut filter_half = Options::default();
+    filter_half.filter = Filter::Level {
+        level: 32,
+        sharpness: 0,
+    };
+    let mut filter_sharp = Options::default();
+    filter_sharp.filter = Filter::Level {
+        level: 63,
+        sharpness: 3,
+    };
     vec![
         (vec![], Options::default()),
         (vec!["-q", "0"], q0),
         (vec!["-q", "50"], q50),
         (vec!["-q", "100"], q100),
         (vec!["-noalpha"], noalpha),
+        (vec!["-f", "0"], filter_off),
+        (vec!["-f", "50"], filter_half),
+        (vec!["-f", "100", "-sharpness", "3"], filter_sharp),
+        (vec!["-print_psnr"], Options::default()),
     ]
 }
 
@@ -203,23 +222,11 @@ fn help_and_version_exit_one_with_one_problem_line_when_the_output_pipe_has_no_r
 fn every_usage_error_prints_its_exact_problem_and_the_usage_text() {
     assert_usage_error(
         &["--noalpha=value"],
-        "Unknown command line option. Expected a supported option.",
+        "Unknown command line option --noalpha=value. Expected a supported option.",
     );
     assert_usage_error(
         &["--sharp-yuv", "in.png", "-o", "out.webp"],
         "Unknown flag --sharp-yuv. Expected a supported option.",
-    );
-    assert_usage_error(
-        &["-print_psnr", "in.png", "-o", "out.webp"],
-        "Unknown flag --print_psnr. Expected a supported option.",
-    );
-    assert_usage_error(
-        &["-f", "0", "in.png", "-o", "out.webp"],
-        "Unknown flag -f. Expected a supported option.",
-    );
-    assert_usage_error(
-        &["-sharpness", "0", "in.png", "-o", "out.webp"],
-        "Unknown flag --sharpness. Expected a supported option.",
     );
     for quality in ["75.5", "101", "256", "-1", "high"] {
         assert_usage_error(
@@ -246,6 +253,63 @@ fn every_usage_error_prints_its_exact_problem_and_the_usage_text() {
     assert_usage_error(
         &["in.png", "-o"],
         "Missing value for -o. Expected an output path or -.",
+    );
+}
+
+#[test]
+fn filter_values_require_integers_in_their_ranges() {
+    for value in ["101", "256", "-1", "-100", "50.5", "strong"] {
+        assert_usage_error(
+            &["-f", value, "in.png", "-o", "out.webp"],
+            &format!("Invalid filter strength {value}. Expected a whole number from 0 to 100."),
+        );
+    }
+    for value in ["8", "256", "-1", "-100", "3.5", "sharp"] {
+        assert_usage_error(
+            &["-f", "50", "-sharpness", value, "in.png", "-o", "out.webp"],
+            &format!("Invalid sharpness {value}. Expected a whole number from 0 to 7."),
+        );
+    }
+    assert_usage_error(
+        &["-f"],
+        "Missing value for -f. Pass a whole number from 0 to 100.",
+    );
+    assert_usage_error(
+        &["-sharpness"],
+        "Missing value for -sharpness. Pass a whole number from 0 to 7.",
+    );
+}
+
+#[test]
+fn sharpness_requires_a_filter_strength() {
+    assert_usage_error(
+        &["-sharpness", "3", "in.png", "-o", "out.webp"],
+        "Pass -f with -sharpness to set the loop filter level.",
+    );
+}
+
+#[test]
+fn flag_and_option_problems_preserve_the_typed_spelling() {
+    for flag in ["-unknown", "--unknown", "-z"] {
+        assert_usage_error(
+            &[flag],
+            &format!("Unknown flag {flag}. Expected a supported option."),
+        );
+    }
+    for option in [
+        "-print_psnr=value",
+        "--print_psnr=value",
+        "-noalpha=value",
+        "--quiet=value",
+    ] {
+        assert_usage_error(
+            &[option],
+            &format!("Unknown command line option {option}. Expected a supported option."),
+        );
+    }
+    assert_usage_error(
+        &["--noalpha", "-noalpha=value"],
+        "Unknown command line option -noalpha=value. Expected a supported option.",
     );
 }
 
@@ -586,7 +650,7 @@ fn an_oversized_decoded_image_exits_one_with_one_exact_problem_line() {
     assert_eq!(
         String::from_utf8_lossy(&output.stderr),
         format!(
-            "tiny-webp: Could not encode {}. The decoded image dimensions are unsupported.\n",
+            "tiny-webp: Could not encode {}. Expected dimensions from 1 through 16383 per side.\n",
             input.display()
         )
     );
@@ -605,6 +669,151 @@ fn quiet_success_writes_neither_stream_for_a_file_output() {
     assert_eq!(output.stdout, b"");
     assert_eq!(output.stderr, b"");
     assert!(output_path.exists(), "the output file is missing");
+    std::fs::remove_dir_all(directory).expect("remove the test directory");
+}
+
+fn decoded_rgb_psnr(source: &[u8], webp: &[u8]) -> String {
+    let mut decoder = image_webp::WebPDecoder::new(Cursor::new(webp)).expect("decode the output");
+    let (width, height) = decoder.dimensions();
+    let channels = if decoder.has_alpha() { 4 } else { 3 };
+    let mut decoded = vec![0; width as usize * height as usize * channels];
+    decoder
+        .read_image(&mut decoded)
+        .expect("read the output pixels");
+    let error: f64 = source
+        .chunks_exact(4)
+        .zip(decoded.chunks_exact(channels))
+        .flat_map(|(source, decoded)| {
+            (0..3).map(move |channel| {
+                (f64::from(source[channel]) - f64::from(decoded[channel])).powi(2)
+            })
+        })
+        .sum();
+    let mean = error / (width * height * 3) as f64;
+    let psnr = if mean == 0.0 {
+        99.0
+    } else {
+        10.0 * (65025.0 / mean).log10()
+    };
+    format!("{psnr:.2}")
+}
+
+#[test]
+fn psnr_precedes_the_summary_and_measures_rgb_without_alpha() {
+    let directory = scratch_directory("psnr_precedes_the_summary_and_measures_rgb_without_alpha");
+    for name in ["gradient", "alpha-odd"] {
+        let fixture = generator::all()
+            .into_iter()
+            .find(|fixture| fixture.name == name)
+            .expect("find the fixture");
+        let input = directory.join(format!("{name}.png"));
+        let output_path = directory.join("output.webp");
+        std::fs::write(&input, png_bytes(&fixture)).expect("write the input pixels");
+        for flags in [
+            vec!["-q", "75", "-print_psnr"],
+            vec!["-q", "75", "--print_psnr", "-noalpha"],
+        ] {
+            let output = run_file(&input, &output_path, &flags);
+            let encoded = std::fs::read(&output_path).expect("read the output");
+            let psnr = decoded_rgb_psnr(&fixture.rgba, &encoded);
+            assert_eq!(output.status.code(), Some(0));
+            assert_eq!(output.stdout, b"");
+            assert_eq!(
+                String::from_utf8_lossy(&output.stderr),
+                format!(
+                    "tiny-webp: psnr {psnr} dB\ntiny-webp: wrote {} bytes to {}\n",
+                    encoded.len(),
+                    output_path.display()
+                )
+            );
+        }
+    }
+    std::fs::remove_dir_all(directory).expect("remove the test directory");
+}
+
+#[test]
+fn exact_rgb_reconstruction_prints_ninety_nine_decibels() {
+    let directory = scratch_directory("exact_rgb_reconstruction_prints_ninety_nine_decibels");
+    let input = directory.join("black.png");
+    let output_path = directory.join("output.webp");
+    std::fs::write(
+        &input,
+        png_with_color(1, 1, png::ColorType::Rgb, &[0, 0, 0]),
+    )
+    .expect("write black pixels");
+    let output = run_file(&input, &output_path, &["-q", "100", "-print_psnr"]);
+    let encoded = std::fs::read(&output_path).expect("read the output");
+    assert_eq!(decoded_rgb_psnr(&[0, 0, 0, 255], &encoded), "99.00");
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        format!(
+            "tiny-webp: psnr 99.00 dB\ntiny-webp: wrote {} bytes to {}\n",
+            encoded.len(),
+            output_path.display()
+        )
+    );
+    std::fs::remove_dir_all(directory).expect("remove the test directory");
+}
+
+#[test]
+fn quiet_suppresses_psnr_and_keeps_the_encoded_bytes() {
+    let directory = scratch_directory("quiet_suppresses_psnr_and_keeps_the_encoded_bytes");
+    let fixture = generator::all()
+        .into_iter()
+        .find(|fixture| fixture.name == "gradient")
+        .expect("find the gradient");
+    let input = directory.join("gradient.png");
+    let output_path = directory.join("output.webp");
+    std::fs::write(&input, png_bytes(&fixture)).expect("write the input pixels");
+    let output = run_file(&input, &output_path, &["-print_psnr", "-quiet"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"");
+    assert_eq!(output.stderr, b"");
+    let expected = tiny_webp::encode_rgba(
+        &fixture.rgba,
+        fixture.width,
+        fixture.height,
+        &Options::default(),
+    )
+    .expect("encode the fixture");
+    assert_eq!(
+        std::fs::read(output_path).expect("read the output"),
+        expected
+    );
+    std::fs::remove_dir_all(directory).expect("remove the test directory");
+}
+
+#[test]
+fn repeated_filter_flags_take_their_last_values_in_either_order() {
+    let directory =
+        scratch_directory("repeated_filter_flags_take_their_last_values_in_either_order");
+    let fixture = generator::all()
+        .into_iter()
+        .find(|fixture| fixture.name == "gradient")
+        .expect("find the gradient");
+    let input = directory.join("gradient.png");
+    let output_path = directory.join("output.webp");
+    std::fs::write(&input, png_bytes(&fixture)).expect("write the input pixels");
+    let mut options = Options::default();
+    options.filter = Filter::Level {
+        level: 32,
+        sharpness: 7,
+    };
+    let expected = tiny_webp::encode_rgba(&fixture.rgba, fixture.width, fixture.height, &options)
+        .expect("encode the fixture");
+    for flags in [
+        vec!["-f", "0", "-sharpness", "1", "-f", "50", "-sharpness", "7"],
+        vec!["--sharpness", "7", "-f", "50"],
+    ] {
+        let output = run_file(&input, &output_path, &flags);
+        assert_eq!(output.status.code(), Some(0));
+        assert_eq!(
+            std::fs::read(&output_path).expect("read the output"),
+            expected
+        );
+    }
     std::fs::remove_dir_all(directory).expect("remove the test directory");
 }
 

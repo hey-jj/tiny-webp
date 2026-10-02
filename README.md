@@ -65,10 +65,15 @@ usage: tiny-webp [options] <input> -o <output.webp>
   -q <0..100>, --quality <0..100>   quality, default 75
   -o <file>,   --output <file>      output path, or - for stdout
   -noalpha                          drop the alpha plane
+  -f <0..100>                       loop filter strength, 0 turns it off
+  -sharpness <0..7>                 loop filter sharpness, needs -f
+  -print_psnr                       decode the result and print PSNR against the input
   -quiet                            no output on success
   -v                                print dimensions, bytes, and encode time
   -version, --version
   -h, --help
+
+Filter strength S sets the level to round(S * 63 / 100).
 ```
 
 cwebp spells `-noalpha`, `-quiet`, and `-version` with one dash, and both

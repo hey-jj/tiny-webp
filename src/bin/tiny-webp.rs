@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
@@ -9,7 +10,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use lexopt::prelude::{Long, Short, Value};
-use tiny_webp::{Alpha, Options};
+use tiny_webp::{Alpha, Filter, Options};
 
 const USAGE: &str = "\
 usage: tiny-webp [options] <input> -o <output.webp>
@@ -17,21 +18,30 @@ usage: tiny-webp [options] <input> -o <output.webp>
   -q <0..100>, --quality <0..100>   quality, default 75
   -o <file>,   --output <file>      output path, or - for stdout
   -noalpha                          drop the alpha plane
+  -f <0..100>                       loop filter strength, 0 turns it off
+  -sharpness <0..7>                 loop filter sharpness, needs -f
+  -print_psnr                       decode the result and print PSNR against the input
   -quiet                            no output on success
   -v                                print dimensions, bytes, and encode time
   -version, --version
   -h, --help
+
+Filter strength S sets the level to round(S * 63 / 100).
 ";
 const PROGRAM_PREFIX: &str = "tiny-webp: ";
 const VERSION_PREFIX: &str = "tiny-webp ";
-const LONG_FLAG_PREFIX: &str = "--";
-const SHORT_FLAG_PREFIX: &str = "-";
 const STDOUT_NAME: &str = "stdout";
 const UNKNOWN_FLAG: &str = "Unknown flag {flag}. Expected a supported option.";
-const UNKNOWN_OPTION: &str = "Unknown command line option. Expected a supported option.";
+const UNKNOWN_OPTION: &str = "Unknown command line option {option}. Expected a supported option.";
 const INVALID_QUALITY: &str = "Invalid quality {quality}. Expected a whole number from 0 to 100.";
 const MISSING_QUALITY: &str =
     "Missing value for -q. Pass a quality integer between zero and one hundred.";
+const INVALID_STRENGTH: &str =
+    "Invalid filter strength {value}. Expected a whole number from 0 to 100.";
+const INVALID_SHARPNESS: &str = "Invalid sharpness {value}. Expected a whole number from 0 to 7.";
+const MISSING_STRENGTH: &str = "Missing value for -f. Pass a whole number from 0 to 100.";
+const MISSING_SHARPNESS: &str = "Missing value for -sharpness. Pass a whole number from 0 to 7.";
+const SHARPNESS_NEEDS_STRENGTH: &str = "Pass -f with -sharpness to set the loop filter level.";
 const MISSING_OUTPUT_VALUE: &str = "Missing value for -o. Expected an output path or -.";
 const MISSING_INPUT: &str = "Missing input path. Pass a file or - for stdin.";
 const MISSING_OUTPUT: &str = "Missing output path. Pass -o <file> or -o - for stdout.";
@@ -44,9 +54,11 @@ const JPEG_ERROR: &str = "Could not decode {name} as JPEG.";
 const CMYK_ERROR: &str = "Could not decode {name}. CMYK JPEG input is unsupported.";
 const WEBP_ERROR: &str = "Could not decode {name} as WebP.";
 const ANIMATED_ERROR: &str = "Could not decode {name}. Animated WebP input is unsupported.";
-const ENCODE_ERROR: &str = "Could not encode {name}. The decoded image dimensions are unsupported.";
+const ENCODE_ERROR: &str =
+    "Could not encode {name}. Expected dimensions from 1 through 16383 per side.";
 const WRITE_PATH: &str = "Could not write {name}. Check that the output path is writable.";
 const WRITE_STDOUT: &str = "Could not write stdout. Check that standard output is writable.";
+const PSNR_LINE: &str = "tiny-webp: psnr {value} dB";
 const SUMMARY: &str = "tiny-webp: wrote {bytes} bytes to {output}";
 const VERBOSE_SUMMARY: &str = "tiny-webp: {width}x{height}, {bytes} bytes, {ms}.{micros} ms";
 
@@ -62,6 +74,7 @@ struct Cli {
     options: Options,
     quiet: bool,
     verbose: bool,
+    print_psnr: bool,
 }
 
 enum Pixels {
@@ -83,6 +96,7 @@ struct Success {
     output: OsString,
     quiet: bool,
     verbose: bool,
+    psnr: Option<f64>,
 }
 
 fn main() -> ExitCode {
@@ -94,6 +108,9 @@ fn main() -> ExitCode {
         Ok(Action::Encode(cli)) => match encode(cli) {
             Ok(success) => {
                 if !success.quiet {
+                    if let Some(value) = success.psnr {
+                        eprintln!("{}", PSNR_LINE.replace("{value}", &format!("{value:.2}")));
+                    }
                     eprintln!("{}", summary(&success));
                 }
                 ExitCode::SUCCESS
@@ -130,25 +147,59 @@ where
     let mut options = Options::default();
     let mut quiet = false;
     let mut verbose = false;
+    let mut print_psnr = false;
+    let mut strength = None;
+    let mut sharpness = None;
+    let mut flag_names = VecDeque::new();
 
     let mut values_only = false;
     let mut value_next = false;
-    let args = args.into_iter().map(move |arg| {
-        if values_only || value_next {
-            value_next = false;
-            return arg;
-        }
-        let arg = expand_single_dash(arg);
-        let bytes = arg.as_os_str().as_encoded_bytes();
-        values_only = bytes == b"--";
-        value_next = matches!(bytes, b"-q" | b"--quality" | b"-o" | b"--output");
-        arg
-    });
+    let args: Vec<_> = args
+        .into_iter()
+        .map(|arg| {
+            if values_only || value_next {
+                value_next = false;
+                return arg;
+            }
+            let bytes = arg.as_os_str().as_encoded_bytes();
+            if bytes.starts_with(b"-") && bytes != b"-" && bytes != b"--" {
+                flag_names.push_back(arg.clone());
+            }
+            let arg = expand_single_dash(arg);
+            let bytes = arg.as_os_str().as_encoded_bytes();
+            values_only = bytes == b"--";
+            value_next = matches!(
+                bytes,
+                b"-q" | b"--quality" | b"-o" | b"--output" | b"-f" | b"--sharpness"
+            );
+            arg
+        })
+        .collect();
     let mut parser = lexopt::Parser::from_args(args);
-    while let Some(arg) = parser.next().map_err(|_| UNKNOWN_OPTION.to_owned())? {
+    while let Some(arg) = parser.next().map_err(|_| {
+        UNKNOWN_OPTION.replace(
+            "{option}",
+            &display_path(
+                flag_names
+                    .front()
+                    .map_or(OsStr::new(""), OsString::as_os_str),
+            ),
+        )
+    })? {
+        let flag_name = if matches!(arg, Short(_) | Long(_)) {
+            flag_names.pop_front().unwrap_or_default()
+        } else {
+            OsString::new()
+        };
         match arg {
-            Short('h') | Long("help") => return Ok(Action::Help),
-            Long("version") => return Ok(Action::Version),
+            Short('h') | Long("help") => {
+                require_word_flag(&mut parser, &flag_name)?;
+                return Ok(Action::Help);
+            }
+            Long("version") => {
+                require_word_flag(&mut parser, &flag_name)?;
+                return Ok(Action::Version);
+            }
             Short('q') | Long("quality") => {
                 let raw = parser.value().map_err(|_| MISSING_QUALITY.to_owned())?;
                 options.quality = parse_quality(&raw)?;
@@ -160,11 +211,33 @@ where
                         .map_err(|_| MISSING_OUTPUT_VALUE.to_owned())?,
                 );
             }
-            Long("noalpha") => options.alpha = Alpha::Discard,
-            Long("quiet") => quiet = true,
-            Short('v') => verbose = true,
-            Long(flag) => return Err(unknown_long_flag(flag)),
-            Short(flag) => return Err(unknown_short_flag(flag)),
+            Short('f') => {
+                let raw = parser.value().map_err(|_| MISSING_STRENGTH.to_owned())?;
+                strength = Some(parse_bounded(&raw, 100, INVALID_STRENGTH)?);
+            }
+            Long("sharpness") => {
+                let raw = parser.value().map_err(|_| MISSING_SHARPNESS.to_owned())?;
+                sharpness = Some(parse_bounded(&raw, 7, INVALID_SHARPNESS)?);
+            }
+            Long("print_psnr") => {
+                require_word_flag(&mut parser, &flag_name)?;
+                print_psnr = true;
+            }
+            Long("noalpha") => {
+                require_word_flag(&mut parser, &flag_name)?;
+                options.alpha = Alpha::Discard;
+            }
+            Long("quiet") => {
+                require_word_flag(&mut parser, &flag_name)?;
+                quiet = true;
+            }
+            Short('v') => {
+                require_word_flag(&mut parser, &flag_name)?;
+                verbose = true;
+            }
+            Long(_) | Short(_) => {
+                return Err(UNKNOWN_FLAG.replace("{flag}", &display_path(&flag_name)));
+            }
             Value(path) => {
                 if input.replace(path.clone()).is_some() {
                     return Err(named_problem(SECOND_INPUT, &path));
@@ -173,6 +246,14 @@ where
         }
     }
 
+    if let Some(strength) = strength {
+        options.filter = Filter::Level {
+            level: ((u16::from(strength) * 63 + 50) / 100) as u8,
+            sharpness: sharpness.unwrap_or(0),
+        };
+    } else if sharpness.is_some() {
+        return Err(SHARPNESS_NEEDS_STRENGTH.to_owned());
+    }
     let input = input.ok_or_else(|| MISSING_INPUT.to_owned())?;
     let output = output.ok_or_else(|| MISSING_OUTPUT.to_owned())?;
     Ok(Action::Encode(Cli {
@@ -181,7 +262,16 @@ where
         options,
         quiet,
         verbose,
+        print_psnr,
     }))
+}
+
+fn require_word_flag(parser: &mut lexopt::Parser, name: &OsStr) -> Result<(), String> {
+    if parser.optional_value().is_some() {
+        Err(UNKNOWN_OPTION.replace("{option}", &display_path(name)))
+    } else {
+        Ok(())
+    }
 }
 
 fn expand_single_dash(arg: OsString) -> OsString {
@@ -203,16 +293,12 @@ fn parse_quality(raw: &OsStr) -> Result<u8, String> {
     }
 }
 
-fn unknown_long_flag(flag: &str) -> String {
-    let mut name = String::from(LONG_FLAG_PREFIX);
-    name.push_str(flag);
-    UNKNOWN_FLAG.replace("{flag}", &name)
-}
-
-fn unknown_short_flag(flag: char) -> String {
-    let mut name = String::from(SHORT_FLAG_PREFIX);
-    name.push(flag);
-    UNKNOWN_FLAG.replace("{flag}", &name)
+fn parse_bounded(raw: &OsStr, maximum: u8, problem: &str) -> Result<u8, String> {
+    let text = raw.to_string_lossy();
+    match text.parse::<u8>() {
+        Ok(value) if value <= maximum => Ok(value),
+        _ => Err(problem.replace("{value}", &display_path(raw))),
+    }
 }
 
 fn encode(cli: Cli) -> Result<Success, String> {
@@ -229,6 +315,12 @@ fn encode(cli: Cli) -> Result<Success, String> {
     }
     .map_err(|_| named_problem(ENCODE_ERROR, &cli.input))?;
     let micros = started.elapsed().as_micros();
+    let psnr = if cli.print_psnr && !cli.quiet {
+        let decoded = decode_webp(&encoded, &cli.output)?;
+        Some(rgb_psnr(&image.pixels, &decoded.pixels))
+    } else {
+        None
+    };
     write_output(&cli.output, &encoded)?;
     Ok(Success {
         width: image.width,
@@ -238,7 +330,36 @@ fn encode(cli: Cli) -> Result<Success, String> {
         output: cli.output,
         quiet: cli.quiet,
         verbose: cli.verbose,
+        psnr,
     })
+}
+
+fn rgb_psnr(source: &Pixels, decoded: &Pixels) -> f64 {
+    let (source, source_channels) = match source {
+        Pixels::Rgb(bytes) => (bytes, 3),
+        Pixels::Rgba(bytes) => (bytes, 4),
+    };
+    let (decoded, decoded_channels) = match decoded {
+        Pixels::Rgb(bytes) => (bytes, 3),
+        Pixels::Rgba(bytes) => (bytes, 4),
+    };
+    let mut squared_error = 0_u64;
+    for (source, decoded) in source
+        .chunks_exact(source_channels)
+        .zip(decoded.chunks_exact(decoded_channels))
+    {
+        for channel in 0..3 {
+            let difference = i64::from(source[channel]) - i64::from(decoded[channel]);
+            squared_error += (difference * difference) as u64;
+        }
+    }
+    if squared_error == 0 {
+        99.0
+    } else {
+        let samples = source.len() / source_channels * 3;
+        let mean_squared_error = squared_error as f64 / samples as f64;
+        10.0 * (255.0 * 255.0 / mean_squared_error).log10()
+    }
 }
 
 fn read_input(input: &OsStr) -> Result<Vec<u8>, String> {
