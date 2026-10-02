@@ -260,23 +260,23 @@ fn pixel_bytes(width: u32, height: u32) -> usize {
     width as usize * height as usize * 4
 }
 
-/// A 32-bit generator whose sequence follows from a fixture name.
-struct Rng(u32);
+/// A 32-bit generator whose sequence follows from a name.
+pub(crate) struct Rng(u32);
 
 impl Rng {
     /// Seeds the generator with the FNV-1a hash of `name`.
-    fn seeded(name: &str) -> Self {
+    pub(crate) fn seeded(name: &str) -> Self {
         let mut state: u32 = 0x811c_9dc5;
         for byte in name.as_bytes() {
             state ^= u32::from(*byte);
             state = state.wrapping_mul(0x0100_0193);
         }
-        // xorshift stalls at zero, so the low bit is forced on.
+        // x ^ (x << n) and x ^ (x >> n) both keep zero at zero.
         Self(state | 1)
     }
 
     /// Advances the xorshift32 state and returns it.
-    fn next_u32(&mut self) -> u32 {
+    pub(crate) fn next_u32(&mut self) -> u32 {
         let mut state = self.0;
         state ^= state << 13;
         state ^= state >> 17;
@@ -285,8 +285,100 @@ impl Rng {
         state
     }
 
-    /// Takes the top byte of the next word, which mixes better than the low one.
-    fn next_byte(&mut self) -> u8 {
-        (self.next_u32() >> 24) as u8
+    /// Returns the top byte of the next word, `word >> 24`.
+    pub(crate) fn next_byte(&mut self) -> u8 {
+        self.below(256) as u8
+    }
+
+    /// Returns `floor(word * bound / 2^32)` from the next word.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `bound` is zero.
+    pub(crate) fn below(&mut self, bound: u32) -> u32 {
+        assert!(bound > 0, "the random bound must be positive");
+        ((u64::from(self.next_u32()) * u64::from(bound)) >> 32) as u32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn sources_with_the_same_name_agree_for_one_thousand_draws() {
+        for name in ["", "random-draws", "noise", "pixels-\u{03bb}"] {
+            let mut left = super::Rng::seeded(name);
+            let mut right = super::Rng::seeded(name);
+            for _ in 0..1_000 {
+                assert_eq!(left.next_u32(), right.next_u32());
+                assert_eq!(left.next_byte(), right.next_byte());
+                assert_eq!(left.below(65_536), right.below(65_536));
+            }
+        }
+    }
+
+    #[test]
+    fn different_names_differ_within_sixteen_draws() {
+        let mut left = super::Rng::seeded("random-draws");
+        let mut right = super::Rng::seeded("bounded-draws");
+        let words: [(u32, u32); 16] = core::array::from_fn(|_| (left.next_u32(), right.next_u32()));
+        assert_eq!(words.iter().position(|(a, b)| a != b), Some(0));
+    }
+
+    #[test]
+    fn named_draws_pin_words_bytes_and_bounded_values() {
+        let mut rng = super::Rng::seeded("random-draws");
+        let draws: [(u32, u8, u32); 4] =
+            core::array::from_fn(|_| (rng.next_u32(), rng.next_byte(), rng.below(65_536)));
+        assert_eq!(
+            draws,
+            [
+                (2_726_729_151, 118, 20_277),
+                (1_135_808_518, 23, 63_789),
+                (3_920_657_851, 38, 19_053),
+                (486_381_369, 109, 33_687),
+            ]
+        );
+    }
+
+    #[test]
+    fn ten_thousand_bounded_draws_stay_below_each_bound() {
+        for (bound, expected_min, expected_max, expected_sum) in [
+            (1, 0, 0, 0),
+            (2, 0, 1, 5_096),
+            (3, 0, 2, 10_184),
+            (255, 0, 254, 1_286_897),
+            (65_536, 2, 65_533, 332_015_601),
+            (u32::MAX, 167_964, 4_294_801_605, 21_759_301_293_698),
+        ] {
+            let mut rng = super::Rng::seeded("bounded-draws");
+            let mut minimum = u32::MAX;
+            let mut maximum = 0;
+            let mut sum = 0_u64;
+            let mut out_of_range = 0;
+            for _ in 0..10_000 {
+                let value = rng.below(bound);
+                minimum = minimum.min(value);
+                maximum = maximum.max(value);
+                sum += u64::from(value);
+                out_of_range += usize::from(value >= bound);
+            }
+            assert_eq!(out_of_range, 0, "bound {bound}");
+            assert_eq!(
+                (minimum, maximum, sum),
+                (expected_min, expected_max, expected_sum)
+            );
+        }
+    }
+
+    #[test]
+    fn a_zero_bound_panics_before_advancing_the_source() {
+        let mut rng = super::Rng::seeded("random-draws");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rng.below(0)));
+        let error = result.expect_err("a zero bound must panic");
+        assert_eq!(
+            error.downcast_ref::<&str>(),
+            Some(&"the random bound must be positive")
+        );
+        assert_eq!(rng.next_u32(), 2_726_729_151);
     }
 }
