@@ -2031,7 +2031,6 @@ mod tests {
     ) {
         let options = Options {
             quality,
-            filter: Filter::Off,
             ..Options::default()
         };
         let rgb = rgb_bytes(&fixture.rgba);
@@ -2096,7 +2095,7 @@ mod tests {
         entry: &str,
     ) {
         let options = Options {
-            filter: Filter::Off,
+            quality,
             ..Options::default()
         };
         let index = quantizer_index(quality);
@@ -2113,6 +2112,7 @@ mod tests {
             "{entry} {}x{} q{quality}",
             fixture.width, fixture.height
         );
+        assert_eq!(read_filter_fields(&encoded.webp), (index.min(63), 0));
         assert_encoded_reconstruction(directory, fixture, index, &encoded);
     }
 

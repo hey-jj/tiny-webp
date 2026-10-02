@@ -3,7 +3,7 @@
 #![forbid(unsafe_code)]
 
 #[path = "../fixtures/generator.rs"]
-mod generator;
+pub(crate) mod generator;
 
 use std::fmt::Write;
 
@@ -90,8 +90,6 @@ pub(crate) fn manifest() -> String {
         });
     }
 
-    rows.sort_by_key(|row| (row.fixture, row.quality, row.entry, row.options));
-
     let mut output = String::new();
     for row in rows {
         write!(
@@ -105,7 +103,11 @@ pub(crate) fn manifest() -> String {
         }
         output.push('\n');
     }
-    output
+    let mut lines: Vec<_> = output.lines().collect();
+    lines.sort_unstable();
+    let mut sorted = lines.join("\n");
+    sorted.push('\n');
+    sorted
 }
 
 fn hash(bytes: &[u8]) -> [u8; 32] {
