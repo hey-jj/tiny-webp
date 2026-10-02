@@ -120,16 +120,23 @@ pub(crate) fn forward_wht(input: &[i32; 16]) -> [i32; 16] {
 pub(crate) fn forward_dct(input: &[i32; 16]) -> [i32; 16] {
     debug_assert!(input.iter().all(|value| (-255..=255).contains(value)));
 
+    // Keeping both basis factors intact preserves round(2 * B * input * B^T / 2^32).
+    let mut rows = [[0i64; 4]; 4];
+    for row in 0..4 {
+        for (horizontal, basis) in DCT_BASIS.iter().enumerate() {
+            for column in 0..4 {
+                rows[row][horizontal] +=
+                    i64::from(input[row * 4 + column]) * i64::from(basis[column]);
+            }
+        }
+    }
+
     let mut output = [0; 16];
-    for vertical in 0..4 {
+    for (vertical, basis) in DCT_BASIS.iter().enumerate() {
         for horizontal in 0..4 {
             let mut sum = 0i64;
             for row in 0..4 {
-                for column in 0..4 {
-                    sum += i64::from(input[row * 4 + column])
-                        * i64::from(DCT_BASIS[vertical][row])
-                        * i64::from(DCT_BASIS[horizontal][column]);
-                }
+                sum += rows[row][horizontal] * i64::from(basis[row]);
             }
             output[vertical * 4 + horizontal] = rounded_shift(sum * 2, 32);
         }
@@ -161,7 +168,7 @@ fn rounded_shift(value: i64, bits: u32) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{clamped_add, forward_dct, forward_wht, inverse_dct, inverse_wht};
+    use super::{clamped_add, forward_dct, forward_wht, inverse_dct, inverse_wht, DCT_BASIS};
 
     #[test]
     fn inverse_dct_spreads_a_lone_dc_value_across_the_block() {
@@ -304,6 +311,42 @@ mod tests {
             );
         }
         assert_eq!((largest_dct, largest_wht), (2040, 16320));
+    }
+
+    #[test]
+    fn separable_dct_preserves_the_full_sum_before_rounding() {
+        let check = |block: &[i32; 16]| {
+            let expected = core::array::from_fn(|position| {
+                let mut sum = 0i64;
+                for row in 0..4 {
+                    for column in 0..4 {
+                        sum += i64::from(block[row * 4 + column])
+                            * i64::from(DCT_BASIS[position / 4][row])
+                            * i64::from(DCT_BASIS[position % 4][column]);
+                    }
+                }
+                let magnitude = (sum.abs() * 2 + (1i64 << 31)) >> 32;
+                (sum.signum() * magnitude) as i32
+            });
+            assert_eq!(forward_dct(block), expected, "block {block:?}");
+        };
+        for position in 0..16 {
+            for value in -255..=255 {
+                let mut block = [0; 16];
+                block[position] = value;
+                check(&block);
+            }
+        }
+        let mut state = 0x49a7_36cdu32;
+        for _ in 0..4096 {
+            let block = core::array::from_fn(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                (state % 511) as i32 - 255
+            });
+            check(&block);
+        }
     }
 
     #[test]

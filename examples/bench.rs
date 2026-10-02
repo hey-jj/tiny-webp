@@ -148,13 +148,19 @@ fn prepare_scratch() -> Result<PathBuf, Box<dyn Error>> {
 }
 
 fn run(smoke: bool, scratch: Option<&Path>) -> Result<(), Box<dyn Error>> {
+    let binary = std::env::current_exe()?
+        .parent()
+        .and_then(Path::parent)
+        .ok_or("the example needs its Cargo build directory")?
+        .join(format!("tiny-webp{}", std::env::consts::EXE_SUFFIX));
     let fixtures = generator::all();
+    let mut memory_failures = Vec::new();
     let qualities: &[u8] = if smoke { &[75] } else { &[50, 75, 90] };
     for quality in qualities {
         let mut options = Options::default();
         options.quality = *quality;
         for fixture in &fixtures {
-            if smoke && fixture.name != "flat" {
+            if smoke && !smoke_fixture(fixture.name) {
                 continue;
             }
             let pixels = fixture.width as usize * fixture.height as usize;
@@ -164,19 +170,22 @@ fn run(smoke: bool, scratch: Option<&Path>) -> Result<(), Box<dyn Error>> {
                 tiny_webp::encode_rgba(&fixture.rgba, fixture.width, fixture.height, &options)?;
             let elapsed = started.elapsed();
             let peak_bytes = peak_heap_growth(baseline);
+            let memory_bound_held = memory_bound_holds(pixels, peak_bytes);
             let psnr = rgb_psnr(&encoded, &fixture.rgba, fixture.width, fixture.height)?;
             print!(
-                "{} q{} megapixels_per_second={:.3} peak_heap_bytes_per_pixel={:.3} bytes={} rgb_psnr_db={:.3}",
+                "{} q{} megapixels_per_second={:.3} peak_heap_bytes_per_pixel={:.3} bytes={} rgb_psnr_db={:.3} peak_heap_bytes={} memory_bound_held={}",
                 fixture.name,
                 quality,
                 megapixels_per_second(pixels, elapsed),
                 peak_bytes as f64 / pixels as f64,
                 encoded.len(),
-                psnr
+                psnr,
+                peak_bytes,
+                if memory_bound_held { "yes" } else { "no" }
             );
 
             if let Some(directory) = scratch {
-                let comparison = run_cwebp(directory, fixture, *quality)?;
+                let comparison = compare_processes(&binary, directory, fixture, *quality)?;
                 let comparison_psnr = rgb_psnr(
                     &comparison.bytes,
                     &fixture.rgba,
@@ -184,57 +193,106 @@ fn run(smoke: bool, scratch: Option<&Path>) -> Result<(), Box<dyn Error>> {
                     fixture.height,
                 )?;
                 print!(
-                    " cwebp_bytes={} tiny_webp_to_cwebp_size_ratio={:.3} cwebp_rgb_psnr_db={:.3} cwebp_subprocess_ms={:.3}",
+                    " cwebp_bytes={} tiny_webp_to_cwebp_size_ratio={:.3} cwebp_rgb_psnr_db={:.3} tiny_webp_subprocess_ms={:.3} cwebp_subprocess_ms={:.3} tiny_webp_to_cwebp_time_ratio={:.3}",
                     comparison.bytes.len(),
                     encoded.len() as f64 / comparison.bytes.len() as f64,
                     comparison_psnr,
-                    comparison.elapsed.as_secs_f64() * 1000.0
+                    comparison.tiny_webp_elapsed.as_secs_f64() * 1000.0,
+                    comparison.cwebp_elapsed.as_secs_f64() * 1000.0,
+                    comparison.tiny_webp_elapsed.as_secs_f64()
+                        / comparison.cwebp_elapsed.as_secs_f64()
                 );
             }
             println!();
+            if !memory_bound_held {
+                memory_failures.push(format!(
+                    "{} at q{} exceeds the memory bound with peak heap growth {} and output size {}",
+                    fixture.name, quality, peak_bytes, encoded.len()
+                ));
+            }
         }
     }
-    Ok(())
+    if memory_failures.is_empty() {
+        Ok(())
+    } else {
+        Err(memory_failures.join("\n").into())
+    }
 }
 
 fn megapixels_per_second(pixels: usize, elapsed: Duration) -> f64 {
     pixels as f64 / 1_000_000.0 / elapsed.as_secs_f64()
 }
 
-struct Comparison {
-    bytes: Vec<u8>,
-    elapsed: Duration,
+fn smoke_fixture(name: &str) -> bool {
+    matches!(name, "flat" | "photo-large")
 }
 
-fn run_cwebp(
+fn memory_bound_holds(pixels: usize, peak_bytes: usize) -> bool {
+    peak_bytes + 4 * pixels <= 8 * pixels + 1024 * 1024
+}
+
+struct Comparison {
+    bytes: Vec<u8>,
+    tiny_webp_elapsed: Duration,
+    cwebp_elapsed: Duration,
+}
+
+fn compare_processes(
+    binary: &Path,
     directory: &Path,
     fixture: &generator::Fixture,
     quality: u8,
 ) -> Result<Comparison, Box<dyn Error>> {
     let input = directory.join(format!("{}.png", fixture.name));
-    let output = directory.join(format!("{}-q{}.webp", fixture.name, quality));
-    let started = Instant::now();
-    let status = Command::new("cwebp")
-        .arg("-quiet")
-        .arg("-q")
-        .arg(quality.to_string())
-        .arg(&input)
-        .arg("-o")
-        .arg(&output)
-        .status()?;
-    let elapsed = started.elapsed();
-    require_success(status, fixture.name, quality)?;
+    let tiny_output = directory.join(format!("{}-q{}-tiny.webp", fixture.name, quality));
+    let cwebp_output = directory.join(format!("{}-q{}-cwebp.webp", fixture.name, quality));
+    let mut tiny_command = encoder_command(binary, &input, &tiny_output, quality);
+    let mut cwebp_command = encoder_command(Path::new("cwebp"), &input, &cwebp_output, quality);
+    measure_process(&mut tiny_command)?;
+    measure_process(&mut cwebp_command)?;
+    let mut tiny_times = [Duration::ZERO; 5];
+    let mut cwebp_times = [Duration::ZERO; 5];
+    for index in 0..5 {
+        tiny_times[index] = measure_process(&mut tiny_command)?;
+        cwebp_times[index] = measure_process(&mut cwebp_command)?;
+    }
     Ok(Comparison {
-        bytes: fs::read(output)?,
-        elapsed,
+        bytes: fs::read(cwebp_output)?,
+        tiny_webp_elapsed: median(tiny_times),
+        cwebp_elapsed: median(cwebp_times),
     })
 }
 
-fn require_success(status: ExitStatus, fixture: &str, quality: u8) -> Result<(), Box<dyn Error>> {
+fn encoder_command(binary: &Path, input: &Path, output: &Path, quality: u8) -> Command {
+    let mut command = Command::new(binary);
+    command
+        .arg("-quiet")
+        .arg("-q")
+        .arg(quality.to_string())
+        .arg(input)
+        .arg("-o")
+        .arg(output);
+    command
+}
+
+fn measure_process(command: &mut Command) -> Result<Duration, Box<dyn Error>> {
+    let started = Instant::now();
+    let status = command.status()?;
+    let elapsed = started.elapsed();
+    require_success(status, command)?;
+    Ok(elapsed)
+}
+
+fn median(mut times: [Duration; 5]) -> Duration {
+    times.sort_unstable();
+    times[2]
+}
+
+fn require_success(status: ExitStatus, command: &Command) -> Result<(), Box<dyn Error>> {
     if status.success() {
         Ok(())
     } else {
-        Err(format!("cwebp failed for {fixture} at q{quality} with {status}").into())
+        Err(format!("{command:?} failed with {status}").into())
     }
 }
 
@@ -266,8 +324,45 @@ fn rgb_psnr(webp: &[u8], source: &[u8], width: u32, height: u32) -> Result<f64, 
         })
         .sum();
     if squared_error == 0 {
-        return Ok(f64::INFINITY);
+        return Ok(99.0);
     }
     let sample_count = u64::from(width) * u64::from(height) * 3;
     Ok(10.0 * ((255.0 * 255.0 * sample_count as f64) / squared_error as f64).log10())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{median, memory_bound_holds, smoke_fixture};
+    use std::time::Duration;
+
+    #[test]
+    fn the_memory_bound_counts_the_callers_rgba_bytes() {
+        let pixels = 1024 * 768;
+        let limit = 4 * pixels + 1024 * 1024;
+        assert_eq!(
+            (
+                memory_bound_holds(pixels, limit),
+                memory_bound_holds(pixels, limit + 1)
+            ),
+            (true, false)
+        );
+    }
+
+    #[test]
+    fn the_median_selects_the_third_of_five_ordered_durations() {
+        assert_eq!(
+            median([8, 1, 9, 3, 2].map(Duration::from_millis)),
+            Duration::from_millis(3)
+        );
+    }
+
+    #[test]
+    fn smoke_mode_includes_flat_and_photo_large() {
+        let names: Vec<_> = super::generator::all()
+            .into_iter()
+            .filter(|fixture| smoke_fixture(fixture.name))
+            .map(|fixture| fixture.name)
+            .collect();
+        assert_eq!(names, ["flat", "photo-large"]);
+    }
 }

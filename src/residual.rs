@@ -328,9 +328,9 @@ pub(crate) struct TokenStream {
 }
 
 impl TokenStream {
-    // B_PRED needs 1 mode byte + 8 sub-block mode bytes + 24 * (1 + 16 * 2) bytes.
-    // The Y2 form needs 1 + 25 + (16 + 16 * 15 + 8 * 16) * 2 = 794 bytes.
-    pub(crate) const MAX_BYTES_PER_MACROBLOCK: usize = 801;
+    // B_PRED needs 1 + 8 + 24 * (1 + 16 * 3) = 1185 bytes at the widest levels.
+    // The Y2 form needs 1 + 25 + (16 + 16 * 15 + 8 * 16) * 3 = 1178 bytes.
+    const MAX_BYTES_PER_MACROBLOCK: usize = 1185;
 
     pub(crate) fn with_capacity(capacity: usize) -> Self {
         Self {
@@ -348,6 +348,7 @@ impl TokenStream {
     }
 
     pub(crate) fn push(&mut self, block: &TokenMacroblock) {
+        self.bytes.reserve_exact(Self::MAX_BYTES_PER_MACROBLOCK);
         let has_y2 = block.luma_mode != 4;
         self.bytes.push(block.luma_mode | block.chroma_mode << 3);
         if has_y2 {
@@ -372,14 +373,13 @@ impl TokenStream {
             .map_or(first, |position| position + 1);
         self.bytes.push(end as u8);
         for &raster in &ZIGZAG[first..end] {
-            let level = levels[raster];
-            // Magnitude * 2 + sign fits in thirteen bits at the section 13.2 limit.
-            let value = (level.unsigned_abs().min(2114) << 1) | u16::from(level < 0);
-            if value < 128 {
-                self.bytes.push(value as u8);
+            let level = levels[raster].clamp(-2114, 2114);
+            // level + 127 covers bytes 0 through 254, leaving 255 for wider levels.
+            if (-127..=127).contains(&level) {
+                self.bytes.push((level + 127) as u8);
             } else {
-                self.bytes.push((value as u8 & 127) | 128);
-                self.bytes.push((value >> 7) as u8);
+                self.bytes.push(255);
+                self.bytes.extend_from_slice(&level.to_le_bytes());
             }
         }
     }
@@ -431,18 +431,11 @@ impl TokenReader<'_> {
         let end = usize::from(self.byte());
         let mut levels = [0; 16];
         for &raster in &ZIGZAG[first..end] {
-            let low = self.byte();
-            let value = u16::from(low & 127)
-                | if low & 128 != 0 {
-                    u16::from(self.byte()) << 7
-                } else {
-                    0
-                };
-            let magnitude = (value >> 1) as i16;
-            levels[raster] = if value & 1 != 0 {
-                -magnitude
+            let byte = self.byte();
+            levels[raster] = if byte == 255 {
+                i16::from_le_bytes([self.byte(), self.byte()])
             } else {
-                magnitude
+                i16::from(byte) - 127
             };
         }
         levels
@@ -1445,7 +1438,8 @@ mod tests {
                 ..TokenMacroblock::default()
             })
             .collect();
-        let mut stream = TokenStream::with_capacity(blocks.len() * 826);
+        let mut stream =
+            TokenStream::with_capacity(blocks.len() * TokenStream::MAX_BYTES_PER_MACROBLOCK);
         let capacity = stream.bytes.capacity();
         let mut direct = ResidualWriter::new(5);
         let mut expected = TraceWriter::default();
@@ -1477,7 +1471,8 @@ mod tests {
     fn every_seeded_macroblock_round_trips_modes_and_coded_levels() {
         let mut seed = 0x7be2_1635;
         let mut expected = Vec::new();
-        let mut stream = TokenStream::with_capacity(5 * 4 * 17 * 826);
+        let mut stream =
+            TokenStream::with_capacity(5 * 4 * 17 * TokenStream::MAX_BYTES_PER_MACROBLOCK);
         for luma_mode in 0..5 {
             for chroma_mode in 0..4 {
                 for sparsity in 0..17 {
@@ -1512,6 +1507,29 @@ mod tests {
     }
 
     #[test]
+    fn stream_growth_reserves_exactly_one_macroblocks_maximum_bytes() {
+        let mut stream = TokenStream::with_capacity(2048);
+        let mut block = TokenMacroblock {
+            luma_mode: 4,
+            ..TokenMacroblock::default()
+        };
+        block.residual.y = [[2114; 16]; 16];
+        block.residual.u = [[2114; 16]; 4];
+        block.residual.v = [[2114; 16]; 4];
+        stream.push(&block);
+        assert_eq!((stream.bytes.len(), stream.capacity()), (1185, 2048));
+        stream.push(&block);
+        assert_eq!((stream.bytes.len(), stream.capacity()), (2370, 2370));
+        stream.push(&block);
+        assert_eq!((stream.bytes.len(), stream.capacity()), (3555, 3555));
+        let mut reader = stream.reader();
+        for _ in 0..3 {
+            assert_eq!(reader.next_macroblock(), Some(block.clone()));
+        }
+        assert_eq!(reader.next_macroblock(), None);
+    }
+
+    #[test]
     fn dense_macroblocks_fit_the_stream_byte_bound() {
         for luma_mode in 0..5 {
             let mut block = TokenMacroblock {
@@ -1539,9 +1557,9 @@ mod tests {
             for _ in 0..3 {
                 stream.push(&block);
             }
-            assert_eq!(before, 2403);
+            assert_eq!(before, 3555);
             assert_eq!(stream.capacity(), before);
-            assert_eq!(stream.bytes.len(), if luma_mode == 4 { 2403 } else { 2382 });
+            assert_eq!(stream.bytes.len(), if luma_mode == 4 { 3555 } else { 3534 });
             let mut reader = stream.reader();
             for _ in 0..3 {
                 assert_eq!(reader.next_macroblock(), Some(block.clone()));
@@ -1552,7 +1570,7 @@ mod tests {
 
     #[test]
     fn compact_blocks_store_only_coded_positions_through_the_last_nonzero() {
-        let mut stream = TokenStream::with_capacity(826);
+        let mut stream = TokenStream::with_capacity(TokenStream::MAX_BYTES_PER_MACROBLOCK);
         stream.push(&TokenMacroblock::default());
         assert_eq!(stream.bytes, [vec![0, 0], vec![1; 16], vec![0; 8]].concat());
         stream.clear();
@@ -1560,24 +1578,58 @@ mod tests {
         block.residual.y2[0] = 1;
         block.residual.y2[1] = -64;
         stream.push(&block);
-        assert_eq!(&stream.bytes[..5], &[0, 2, 2, 129, 1]);
-        assert_eq!(stream.bytes.len(), 29);
+        assert_eq!(&stream.bytes[..4], &[0, 2, 128, 63]);
+        assert_eq!(stream.bytes.len(), 28);
         assert_eq!(stream.reader().next_macroblock(), Some(block));
         stream.clear();
         assert_eq!(stream.reader().next_macroblock(), None);
-        assert_eq!(stream.bytes.capacity(), 826);
+        assert_eq!(
+            stream.bytes.capacity(),
+            TokenStream::MAX_BYTES_PER_MACROBLOCK
+        );
+    }
+
+    #[test]
+    fn levels_through_magnitude_127_use_one_byte_and_wider_levels_round_trip() {
+        for level in -2114_i16..=2114 {
+            let mut stream = TokenStream::with_capacity(4);
+            let mut levels = [0; 16];
+            levels[0] = level;
+            stream.push_block(&levels, 0);
+            let expected_length = if level == 0 {
+                1
+            } else if level.unsigned_abs() <= 127 {
+                2
+            } else {
+                4
+            };
+            assert_eq!(stream.bytes.len(), expected_length, "level {level}");
+            assert_eq!(stream.reader().read_block(0), levels, "level {level}");
+        }
+        for (level, expected) in [
+            (-128, vec![1, 255, 128, 255]),
+            (-127, vec![1, 0]),
+            (127, vec![1, 254]),
+            (128, vec![1, 255, 128, 0]),
+        ] {
+            let mut stream = TokenStream::with_capacity(4);
+            let mut levels = [0; 16];
+            levels[0] = level;
+            stream.push_block(&levels, 0);
+            assert_eq!(stream.bytes, expected);
+        }
     }
 
     #[test]
     fn stream_levels_saturate_at_the_coefficient_category_limit() {
-        let mut stream = TokenStream::with_capacity(826);
+        let mut stream = TokenStream::with_capacity(TokenStream::MAX_BYTES_PER_MACROBLOCK);
         let mut block = TokenMacroblock::default();
         block.residual.y2[0] = i16::MAX;
         block.residual.y2[1] = i16::MIN;
         stream.push(&block);
         block.residual.y2[0] = 2114;
         block.residual.y2[1] = -2114;
-        assert_eq!(&stream.bytes[..6], &[0, 2, 132, 33, 133, 33]);
+        assert_eq!(&stream.bytes[..8], &[0, 2, 255, 66, 8, 255, 190, 247]);
         assert_eq!(stream.reader().next_macroblock(), Some(block));
     }
     #[test]

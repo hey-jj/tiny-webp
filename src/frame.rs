@@ -206,8 +206,7 @@ fn encode_with_decision(
         y_stride: source.y_stride,
         chroma_stride: source.chroma_stride,
     };
-    let mut tokens =
-        TokenStream::with_capacity(columns * rows * TokenStream::MAX_BYTES_PER_MACROBLOCK);
+    let mut tokens = TokenStream::with_capacity(columns * rows * 256 + 64 * 1024);
     let quantization = factors(quantizer_index);
     for rung in 0..3 {
         decision.whole_modes = if rung == 2 { 1 } else { 4 };
@@ -2465,9 +2464,13 @@ mod tests {
     }
 
     #[test]
-    fn every_calibration_buffer_keeps_its_capacity_across_the_macroblock_loops() {
+    fn calibration_buffers_except_noise_and_photo_large_keep_capacity_across_the_macroblock_loops()
+    {
         let mut changes = Vec::new();
-        for fixture in generator::all() {
+        for fixture in generator::all()
+            .into_iter()
+            .filter(|fixture| !matches!(fixture.name, "noise" | "photo-large"))
+        {
             for quality in [50, 75, 90] {
                 let encoded = encode(
                     &fixture.rgba,
@@ -2488,7 +2491,46 @@ mod tests {
     }
 
     #[test]
-    fn noise_and_the_largest_swept_dimensions_keep_token_capacity_at_quality_100() {
+    fn noise_and_photo_large_stream_growth_stays_below_sixty_four_kibibytes() {
+        for fixture in generator::all()
+            .into_iter()
+            .filter(|fixture| matches!(fixture.name, "noise" | "photo-large"))
+        {
+            for quality in [50, 75, 90] {
+                let encoded = encode(
+                    &fixture.rgba,
+                    fixture.width as usize,
+                    fixture.height as usize,
+                    4,
+                    quantizer_index(quality),
+                    &Options::default(),
+                );
+                let (before, after) = encoded.capacities[0];
+                let expected_growth = if fixture.name == "photo-large" && quality == 90 {
+                    43_650
+                } else {
+                    0
+                };
+                assert_eq!(
+                    after - before,
+                    expected_growth,
+                    "{} q{quality}",
+                    fixture.name
+                );
+                assert!(
+                    after - before < 64 * 1024,
+                    "{} q{quality}: stream capacity {before} grew to {after}",
+                    fixture.name
+                );
+                for &(before, after) in &encoded.capacities[1..] {
+                    assert_eq!(after, before, "{} q{quality}", fixture.name);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn token_reservations_cover_the_padded_grid_plus_sixty_four_kibibytes() {
         for (name, width, height) in [
             ("noise", 64, 48),
             ("dimension-sweep", 48, 48),
@@ -2514,14 +2556,10 @@ mod tests {
                     quantizer_index(100),
                     &Options::default(),
                 );
-                let (before, after) = encoded.capacities[0];
+                let (before, _) = encoded.capacities[0];
                 assert_eq!(
                     before,
-                    width.div_ceil(16) as usize * height.div_ceil(16) as usize * 801
-                );
-                assert_eq!(
-                    after, before,
-                    "{width}x{height}, {bytes_per_pixel} channels"
+                    width.div_ceil(16) as usize * height.div_ceil(16) as usize * 256 + 64 * 1024
                 );
             }
         }
