@@ -1,9 +1,11 @@
 //! Encodes RGB and RGBA pixel buffers as lossy WebP files.
 //!
-//! Version 0.1.0 writes one VP8 key frame in a RIFF WebP container. It uses DC
-//! prediction, the Y2 transform path, one token partition, and a fixed
-//! quantizer chosen from [`Options::quality`]. The encoder keeps exact alpha
-//! from non-opaque RGBA input in an uncompressed `ALPH` chunk.
+//! Version 0.2.0 chooses luma, sub-block, and chroma prediction modes by
+//! reconstruction error. It writes one VP8 key frame with two-pass coefficient
+//! probability updates, skip flags for zero residuals, and chroma quantizer
+//! deltas. The default loop filter level follows [`Options::quality`] through
+//! its quantizer index. The RIFF WebP container keeps exact alpha from
+//! non-opaque RGBA input in an uncompressed `ALPH` chunk.
 //!
 //! The library is `no_std` and allocates through `alloc`. It reads and writes
 //! byte slices in memory. Callers own file and stream I/O.

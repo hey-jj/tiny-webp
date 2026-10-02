@@ -3,6 +3,45 @@
 All notable changes to this project are documented here. The format follows
 Keep a Changelog, and the project uses semantic versioning.
 
+## [0.2.0] - 2026-10-02
+
+### Added
+
+- Luma, sub-block, and chroma prediction now choose the smallest
+  reconstruction error across all VP8 prediction modes.
+- Two-pass coefficient probability updates adapt residual coding to each
+  image. Mode selection and quantization run once, in the analysis pass.
+- The skip flag omits residual tokens for macroblocks whose quantized
+  coefficients are all zero.
+- Chroma quantizer deltas set DC to -2 and AC to -4 relative to the base
+  index. Luma and Y2 deltas stay zero.
+- The default loop filter follows `q` through the quantizer index, capped at
+  level 63 with sharpness 0. Decoders apply the signalled filter.
+- `-f` sets filter strength from 0 to 100. The level is
+  `round(strength * 63 / 100)`. Zero turns the filter off.
+- `-sharpness` sets sharpness from 0 to 7 when used with `-f`.
+- `-print_psnr` prints decoded RGB PSNR against the input. `-quiet`
+  suppresses the line.
+- Committed cwebp 1.6.0 reference files let tests reproduce the quality
+  comparison. The RGB PSNR gate allows a gap of 3.0 dB, with two exemptions:
+  `flat` at `q` 50 and `checker` at `q` 75. Their recorded gaps are 4.39 and
+  5.01 dB, each with a further tolerance of 0.1 dB.
+- An in-crate mutation runner checks pixel buffers, dimensions, and options
+  under `cargo test`. `TINY_WEBP_MUTATION_RUNS` sets its run budget. The
+  runner replays saved failing inputs.
+
+### Changed
+
+- Encoded bytes change from 0.1.x at every `q`. Update stored output digests
+  when upgrading. `Filter::Auto` now signals the level derived from the
+  quantizer index.
+- The in-crate mutation runner replaces the separate fuzz package and its
+  lock file. Mutation checks run with the crate's tests.
+- The calibration record adds whole-process timing for both commands and
+  `tiny_webp_to_cwebp_time_ratio` for their comparison. `peak_heap_bytes`
+  reports encode-call heap growth, and `memory_bound_held` includes the
+  caller's RGBA buffer in the memory check.
+
 ## [0.1.1] - 2026-09-09
 
 ### Fixed
@@ -44,8 +83,8 @@ Keep a Changelog, and the project uses semantic versioning.
 
 ## [0.0.0] - 2026-09-03
 
-The charter tree. Nothing at this version is published. A library call that
-clears the dimension and buffer checks returns `Error::Unimplemented`, and the
+The library validates pixel buffers and dimensions, and the command parses
+encoding options. A valid library call returns `Error::Unimplemented`. The
 binary stops after it reads the command line.
 
 ### Added
@@ -62,4 +101,4 @@ binary stops after it reads the command line.
   arithmetic, so the bytes match on every target and every run.
 - A CI workflow that builds and tests on Linux and macOS, builds the library
   and the binary at Rust 1.85.0, and installs libwebp so each log names the
-  version of the oracle that later milestones measure against.
+  decoder version used to check output.
