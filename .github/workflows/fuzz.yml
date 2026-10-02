@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test --test mutation
+      - run: cargo test --release --test mutation
       - name: upload mutation failures
         if: failure()
         uses: actions/upload-artifact@v4

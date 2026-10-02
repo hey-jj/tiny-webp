@@ -56,7 +56,7 @@ jobs:
       - name: run 20000 mutations
         env:
           TINY_WEBP_MUTATION_RUNS: "20000"
-        run: cargo test --test mutation
+        run: cargo test --release --test mutation
       - run: cargo build --no-default-features
       - run: cargo build --no-default-features --features std
       - run: cargo build --all-targets --no-default-features
